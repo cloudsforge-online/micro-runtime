@@ -82,9 +82,23 @@ create table if not exists schema_migrations (
 /**
  * A 64-bit advisory lock key derived from the service name.
  *
- * Session-scoped rather than transaction-scoped because a `noTransaction` migration has no
- * transaction to scope to, and holding one lock across the whole run is what makes the mixed
- * case safe.
+ * **Prior art, and why this differs from it.** Nimbus already solved this, and solved it well:
+ * `platform/services/nimbus/src/db/migrate.ts:188-194` takes `pg_advisory_xact_lock` with a
+ * comment explaining the choice of the transaction-scoped form because it is released
+ * automatically, even if the process dies mid-migration. That is the better choice when every
+ * migration is transactional, and it is the reason Nimbus is the one service in the estate that
+ * survives two replicas booting together.
+ *
+ * This package uses the **session-scoped** form instead, for one reason: a `noTransaction`
+ * migration — in practice `CREATE INDEX CONCURRENTLY`, which Postgres refuses inside a
+ * transaction — has no transaction to scope a lock to. Holding one session lock across the
+ * whole run is what makes a mixed set of transactional and concurrent migrations safe.
+ *
+ * The cost is that the lock must be released explicitly and must be held on one connection,
+ * which is why `migrate()` reserves one. A crashed migrator holds the lock until its connection
+ * drops; Postgres releases it on disconnect, so the failure mode is a delay rather than a
+ * deadlock. If a service never needs a concurrent index, the Nimbus approach is simpler and
+ * should be preferred.
  */
 export function lockKeyFor(service: string): bigint {
   // FNV-1a, 64-bit, folded into a signed bigint — Postgres advisory keys are signed.
