@@ -188,10 +188,30 @@ export class Lifecycle {
 
   async #runProbe(probe: Probe): Promise<{ name: string; kind: 'hard' | 'soft' } & ProbeResult> {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), this.#opts.probeTimeoutMs)
+    let timer: NodeJS.Timeout | undefined
+
+    // The signal alone is not enough. Aborting it asks the probe to stop; a driver that ignores
+    // the signal — and several database clients do — leaves the await pending forever, so
+    // `/readyz` hangs rather than reporting a failure. That is strictly worse than no probe at
+    // all, because a hung readiness endpoint looks identical to a slow one to a load balancer.
+    // So the abort is a courtesy and the race is the guarantee.
+    const timeout = new Promise<'timed-out'>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort()
+        resolve('timed-out')
+      }, this.#opts.probeTimeoutMs)
+      timer.unref?.()
+    })
+
     try {
-      const result = await probe.check(controller.signal)
-      return { name: probe.name, kind: probe.kind, ...result }
+      const outcome = await Promise.race([
+        probe.check(controller.signal).then((result) => ({ ok: true as const, result })),
+        timeout,
+      ])
+      if (outcome === 'timed-out') {
+        return { name: probe.name, kind: probe.kind, state: 'fail', detail: 'probe timed out' }
+      }
+      return { name: probe.name, kind: probe.kind, ...outcome.result }
     } catch (err) {
       return {
         name: probe.name,
@@ -200,7 +220,7 @@ export class Lifecycle {
         detail: controller.signal.aborted ? 'probe timed out' : messageOf(err),
       }
     } finally {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
     }
   }
 

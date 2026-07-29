@@ -79,6 +79,22 @@ test('a probe that hangs fails rather than hanging readiness', async () => {
   assert.equal(report.checks[0]?.detail, 'probe timed out')
 })
 
+test('a probe that IGNORES the abort signal still times out', async () => {
+  // Regression, found by the service template: aborting the signal only asks a probe to stop.
+  // A driver that ignores it left `/readyz` pending forever, which a load balancer cannot
+  // distinguish from slow. The race, not the signal, is what guarantees an answer.
+  const lc = new Lifecycle({ cacheMs: 0, probeTimeoutMs: 20 })
+  lc.addProbe({
+    name: 'stubborn',
+    kind: 'hard',
+    check: () => new Promise<never>(() => {}), // never settles, never listens
+  })
+  lc.markReady()
+  const report = await lc.readyz()
+  assert.equal(report.ready, false)
+  assert.equal(report.checks[0]?.detail, 'probe timed out')
+})
+
 test('a probe that throws is a failure, not a crash', async () => {
   const lc = new Lifecycle({ cacheMs: 0 })
   lc.addProbe({
