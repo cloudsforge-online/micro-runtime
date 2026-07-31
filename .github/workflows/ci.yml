@@ -1,0 +1,40 @@
+name: CI
+
+# The estate's shared runtime packages, run through the same reusable workflow as every service.
+# `source-dir: packages` because this is a workspace of libraries rather than a src/ service; the
+# estate rules still apply to it — these packages are exactly where a hard-coded DSN or an
+# unleased setInterval would spread to every service at once. The db and jobs suites test against
+# a real Postgres (deferred constraints, FOR UPDATE SKIP LOCKED leases), and the workflow exports
+# RUNTIME_TEST_DATABASE_URL, which is precisely the variable those suites read.
+#
+# `build-image: false`: a library ships no container. The hygiene call sets
+# `require-dockerignore: false` for the same reason.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: cloudsforge-online/micro-org/.github/workflows/service-ci.yml@main
+    with:
+      service: runtime
+      source-dir: packages
+      build-image: false
+    secrets:
+      # The sibling checkouts (micro-runtime checks out itself and micro-contracts) are private,
+      # so the workflow needs a contents:read token. Redundant here but harmless, and passing it
+      # keeps every caller in the estate identical.
+      estate_token: ${{ secrets.ESTATE_READ_TOKEN }}
+    permissions:
+      contents: read
+      packages: read
+
+  hygiene:
+    uses: cloudsforge-online/micro-org/.github/workflows/secret-hygiene.yml@main
+    with:
+      require-dockerignore: false
+    permissions:
+      contents: read
