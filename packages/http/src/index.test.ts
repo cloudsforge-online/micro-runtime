@@ -243,3 +243,52 @@ test('an absolute URL bypasses the base URL', async () => {
   await c.get('https://other.example/thing')
   assert.equal(s.calls[0]?.url, 'https://other.example/thing')
 })
+
+test('the retry backoff settles in a process with nothing else holding the loop open', async () => {
+  // THE THIRD INSTANCE OF ONE MISTAKE. `defaultSleep` unref'd its timer, so the promise a retry
+  // awaits resolved only if something else kept the event loop alive. A listening socket does that
+  // in a service, which is why this survived — but not during a drain, where the server is already
+  // closed and the loop is held open only by the in-flight work the drain is waiting for, and not
+  // in a library: @cloudsforge/sdk copied this function and eleven of its tests hung.
+  //
+  // It runs in a CHILD process on purpose. In-process, the test runner's own handles hold the loop
+  // open and the defect is invisible — which is exactly how it stayed invisible here.
+  const { execFileSync } = await import('node:child_process')
+  const script = `
+    const sleep = (ms) => new Promise((r) => { setTimeout(r, ms) })
+    await sleep(80)
+    console.log('SETTLED')
+  `
+  const out = execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+    encoding: 'utf8',
+  })
+  assert.match(out, /SETTLED/, 'an awaited backoff must resolve even when nothing else keeps the loop alive')
+
+  // And the counterexample, so this test cannot pass by accident: unref'd, the same await never
+  // settles and node exits non-zero.
+  const bad = `
+    const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); t.unref?.() })
+    await sleep(80)
+    console.log('SETTLED')
+  `
+  let unrefSettled = true
+  try {
+    execFileSync(process.execPath, ['--input-type=module', '-e', bad], { encoding: 'utf8', stdio: 'pipe' })
+  } catch {
+    unrefSettled = false
+  }
+  assert.equal(unrefSettled, false, 'the unref\'d form must NOT settle — if it does, this test proves nothing')
+})
+
+test('no timer that a promise resolves on is unref\'d', async () => {
+  // The rule that came out of three instances: unref() belongs on a timer nobody is waiting for —
+  // a poll tick, a force-exit bomb — never on one whose expiry is what a promise resolves on.
+  const { readFileSync } = await import('node:fs')
+  const { fileURLToPath } = await import('node:url')
+  const src = readFileSync(fileURLToPath(new URL('./index.ts', import.meta.url)), 'utf8')
+  assert.doesNotMatch(
+    src,
+    /new Promise\([^)]*\)\s*=>\s*\{[^}]*setTimeout[^}]*unref/s,
+    'a timer inside a promise executor must stay referenced',
+  )
+})

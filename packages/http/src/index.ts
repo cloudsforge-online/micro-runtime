@@ -399,9 +399,30 @@ export function redactUrl(url: string): string {
   }
 }
 
+/**
+ * The retry backoff. The timer stays REFERENCED, deliberately.
+ *
+ * An unref'd timer that somebody is `await`ing is a promise that may never settle: if nothing else
+ * holds the event loop open while the backoff runs, Node drains the loop and the retry simply
+ * never fires. In a long-lived service a listening socket hides this, which is why it survived
+ * here — but not everywhere the loop can empty:
+ *
+ *   - **During drain.** The server is closed and the loop is held open only by in-flight work. A
+ *     request awaiting a retry backoff at that moment is exactly the work the drain exists to
+ *     wait for, and an unref'd timer lets the process leave without it.
+ *   - **In a library.** `@cloudsforge/sdk` copied this function verbatim, and in someone else's
+ *     short-lived process eleven of its tests hung on a retry that never fired.
+ *
+ * This is the third instance of the same mistake in this estate — the lifecycle probe timeout and
+ * the drain delay were both unref'd for the same reason and both silently skipped. The rule that
+ * came out of it: `unref()` belongs on a timer nobody is waiting for (a poll tick, a force-exit
+ * bomb), never on one whose expiry is the thing a promise resolves on.
+ *
+ * The cost of referencing is bounded by construction: the timer lives at most `ms`, and only while
+ * a request is between attempts.
+ */
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms)
-    t.unref?.()
+    setTimeout(resolve, ms)
   })
 }
