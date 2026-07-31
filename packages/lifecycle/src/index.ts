@@ -200,7 +200,13 @@ export class Lifecycle {
         controller.abort()
         resolve('timed-out')
       }, this.#opts.probeTimeoutMs)
-      timer.unref?.()
+      // The timer stays REFERENCED, deliberately. Unref'd, the guarantee above has a hole: with a
+      // stubborn probe pending and nothing else keeping the event loop alive, Node exits the loop
+      // instead of firing the timeout, and the race never answers — under Node 22's test runner
+      // that is exactly what happened, and in a draining process it would be a /readyz that hangs
+      // at the worst possible moment. The cost of the reference is bounded by construction: this
+      // timer lives at most probeTimeoutMs and only while a probe is in flight, and shutdown has
+      // its own force-exit bomb, so it cannot keep a dying process alive in any way that matters.
     })
 
     try {
@@ -361,7 +367,12 @@ function messageOf(err: unknown): string {
 function sleep(ms: number): Promise<void> {
   if (ms <= 0) return Promise.resolve()
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms)
-    t.unref?.()
+    // REFERENCED, for the same reason as the probe timeout above and with more at stake. This is
+    // step 2 of the drain — the pause that lets the balancer notice we stopped reporting ready
+    // before we stop accepting. Unref'd, a process whose only remaining work IS the drain exits
+    // the event loop here instead of waiting: the pause silently does not happen, and the drain
+    // drops exactly the requests it exists to protect. It is bounded by drainDelayMs and only
+    // ever runs while a shutdown is already in progress.
+    setTimeout(resolve, ms)
   })
 }
