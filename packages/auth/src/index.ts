@@ -18,6 +18,21 @@
 
 import { createRemoteJWKSet, jwtVerify, errors as joseErrors } from 'jose'
 import type { JWTPayload } from 'jose'
+import { ServiceTokenUnavailableError } from './serviceToken.ts'
+
+/**
+ * The outbound half of the same problem: holding a credential and keeping a live service token.
+ * See `serviceToken.ts` — a service token expires in ten minutes and nothing used to re-mint it.
+ */
+export {
+  CREDENTIAL_PREFIX,
+  ServiceTokenProvider,
+  ServiceTokenUnavailableError,
+  type ExchangedToken,
+  type ProviderEvent,
+  type ProviderSnapshot,
+  type ServiceTokenProviderOptions,
+} from './serviceToken.ts'
 
 export const AUDIENCE = 'cloudsforge'
 
@@ -212,11 +227,20 @@ export function subjectUserId(principal: Principal, requestedUserId?: string): s
   return requestedUserId
 }
 
-/** Maps an auth failure onto the status code it must produce. */
+/**
+ * Maps an auth failure onto the status code it must produce.
+ *
+ * `ServiceTokenUnavailableError` is 503 for the same reason `VerifierUnavailableError` is. Inbound,
+ * an unreachable JWKS means we cannot decide whether the caller is authentic. Outbound, an
+ * unreachable identity means we cannot authenticate ourselves to the peer this request needs. In
+ * neither case has anyone presented a bad credential, and answering 401 to either would blame the
+ * caller for an outage two services away.
+ */
 export function statusFor(err: unknown): 401 | 403 | 503 | null {
   if (err instanceof TokenError) return 401
   if (err instanceof ForbiddenError) return 403
   if (err instanceof VerifierUnavailableError) return 503
+  if (err instanceof ServiceTokenUnavailableError) return 503
   return null
 }
 
