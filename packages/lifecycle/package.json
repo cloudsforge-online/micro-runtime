@@ -13,7 +13,11 @@
     "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
     "access": "public"
   },
-  "files": ["dist"],
+  "files": [
+    "dist",
+    "src",
+    "!src/**/*.test.ts"
+  ],
   "engines": { "node": ">=22" },
   "scripts": {
     "typecheck": "tsc --noEmit",

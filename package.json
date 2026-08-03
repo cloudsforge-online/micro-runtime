@@ -6,8 +6,8 @@
   "packageManager": "pnpm@11.9.0",
   "engines": { "node": ">=22" },
   "scripts": {
-    "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck && tsc -p tools/tsconfig.json",
+    "test": "pnpm -r test && node --import tsx --test tools/*.test.ts",
     "build": "pnpm -r build",
     "check": "pnpm typecheck && pnpm test"
   },
