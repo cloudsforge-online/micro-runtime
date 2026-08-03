@@ -14,6 +14,8 @@ carries the same code by hand in every repository:
 With one repository per service that duplication stops being untidy and becomes structural: a
 cross-cutting fix is forty pull requests. These packages are the answer.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 | Package | Replaces | Zero-dep |
 | --- | --- | --- |
 | `@cloudsforge/lifecycle` | Static `/health` literals, and shutdown that force-exits after 10s | ✅ |
@@ -153,3 +155,10 @@ This has already happened here once.
 Break the thing it guards, watch it go red, then restore it. A guard that has never been observed
 failing is not known to be a guard: the `unreferencedEmitters` check in `micro-identity` passed on
 its first version because its own prose naming a function counted as a reference.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
