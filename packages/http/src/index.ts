@@ -301,12 +301,36 @@ export class HttpClient {
     // aborted when the attempt begins must still abort the request. Registering a listener on an
     // aborted signal never fires, which left the request hanging until its own deadline — the
     // exact class of bug this package exists to remove.
-    const timeoutSignal = AbortSignal.timeout(Math.max(0, remainingMs))
+    //
+    // A REFERENCED TIMER, NOT `AbortSignal.timeout`. This is the fourth instance in this estate of
+    // the same mistake, and the first one in the deadline itself. `AbortSignal.timeout` uses an
+    // UNREF'D timer: it does not hold the event loop open, so if nothing else does, Node drains
+    // the loop and the deadline never fires — leaving the promise this method returns unsettled
+    // for ever. `defaultSleep` at the foot of this file spells the rule out: `unref()` belongs on
+    // a timer nobody is waiting for, never on one whose expiry is the thing a promise resolves on.
+    // A deadline is exactly the second kind.
+    //
+    // It survived because a long-lived service always has a listening socket holding the loop. It
+    // does not survive a short-lived process — `@cloudsforge/sdk` hit that already — and it does
+    // not survive a drain, where the loop is held open only by the in-flight work this deadline
+    // is the ceiling on. It surfaced in this package's own suite as
+    // "Promise resolution is still pending but the event loop has already resolved".
+    //
+    // Holding the loop open costs nothing bounded badly: the timer lives at most `remainingMs`,
+    // only while a request is in flight, and `clearTimeout` in the `finally` below releases it the
+    // instant the attempt settles. A process that cannot exit while it is mid-request is a process
+    // behaving correctly.
+    const deadline = new AbortController()
+    const timer = setTimeout(() => deadline.abort(), Math.max(0, remainingMs))
+    const timeoutSignal = deadline.signal
     const signal = options.signal
       ? AbortSignal.any([options.signal, timeoutSignal])
       : timeoutSignal
 
-    if (options.signal?.aborted) throw options.signal.reason ?? new Error('aborted')
+    if (options.signal?.aborted) {
+      clearTimeout(timer)
+      throw options.signal.reason ?? new Error('aborted')
+    }
 
     try {
       const token = await this.#o.token?.()
@@ -367,6 +391,11 @@ export class HttpClient {
         throw new TimeoutError(url, remainingMs)
       }
       throw err
+    } finally {
+      // Releases the event loop the moment the attempt settles, whichever way it settled. Without
+      // this, a fast call under a long deadline would keep the process alive for the rest of that
+      // deadline — which is the opposite mistake, and just as real.
+      clearTimeout(timer)
     }
   }
 

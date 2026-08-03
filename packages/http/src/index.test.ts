@@ -280,6 +280,80 @@ test('the retry backoff settles in a process with nothing else holding the loop 
   assert.equal(unrefSettled, false, 'the unref\'d form must NOT settle — if it does, this test proves nothing')
 })
 
+test('THE DEADLINE fires in a process with nothing else holding the loop open', async () => {
+  // THE FOURTH INSTANCE OF THE SAME MISTAKE, and the first one in the deadline itself.
+  //
+  // `#attempt` used `AbortSignal.timeout(remainingMs)`. That is an UNREF'D timer — it does not
+  // hold the event loop open — so against a peer that never answers, Node drained the loop and the
+  // deadline never fired, leaving `request()`'s promise unsettled for ever. In a service a
+  // listening socket hides it. It is not hidden during a drain, where the loop is held open only
+  // by the in-flight work the deadline is the ceiling on, and it is not hidden in a short-lived
+  // process: this package's own CI reported it as "Promise resolution is still pending but the
+  // event loop has already resolved", and took every test after it down as cancelledByParent.
+  //
+  // THE TEST ABOVE COULD NOT HAVE CAUGHT IT. It runs a REIMPLEMENTATION of `defaultSleep` in a
+  // child rather than this package's code, so it says nothing about any other timer here. This one
+  // drives the real `HttpClient` against a peer that hangs, in a child process whose loop has
+  // nothing else in it at all.
+  const { execFileSync } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const here = fileURLToPath(new URL('./index.ts', import.meta.url))
+  const script = `
+    const { HttpClient, TimeoutError } = await import(${JSON.stringify(here)})
+    // Hangs until aborted, exactly as a real fetch against an unresponsive peer behaves. A fake
+    // that ignored the signal would never settle whatever the library did, and would be testing
+    // the fake.
+    const hang = (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')))
+      })
+    const c = new HttpClient({ baseUrl: 'http://hung:4000', name: 'hung', fetch: hang })
+    try {
+      await c.get('/x', { deadlineMs: 60, retries: 0 })
+      console.log('NO_TIMEOUT')
+    } catch (err) {
+      console.log(err instanceof TimeoutError ? 'TIMED_OUT' : 'OTHER:' + err)
+    }
+  `
+  const out = execFileSync(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '-e', script],
+    { encoding: 'utf8', stdio: 'pipe' },
+  )
+  // An empty stdout is the failure this exists for: the process exited before the deadline fired,
+  // so neither branch above ever ran.
+  assert.match(
+    out,
+    /TIMED_OUT/,
+    `the deadline must fire even when nothing else keeps the loop alive (got ${JSON.stringify(out)})`,
+  )
+})
+
+test('a settled request does NOT keep the process alive for the rest of its deadline', async () => {
+  // The opposite mistake, and just as real: referencing the deadline timer without clearing it
+  // would make a 5ms call under a 30s deadline hold the loop open for thirty seconds. Measured as
+  // wall-clock exit time in a child, because "did it exit promptly" is the actual property.
+  const { execFileSync } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const here = fileURLToPath(new URL('./index.ts', import.meta.url))
+  const script = `
+    const { HttpClient } = await import(${JSON.stringify(here)})
+    const ok = async () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })
+    const c = new HttpClient({ baseUrl: 'http://peer:4000', name: 'peer', fetch: ok })
+    await c.get('/x', { deadlineMs: 30_000 })
+    console.log('DONE')
+  `
+  const started = Date.now()
+  const out = execFileSync(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '-e', script],
+    { encoding: 'utf8', stdio: 'pipe' },
+  )
+  const elapsed = Date.now() - started
+  assert.match(out, /DONE/)
+  assert.ok(elapsed < 20_000, `the process took ${elapsed}ms to exit after a request that succeeded`)
+})
+
 test('no timer that a promise resolves on is unref\'d', async () => {
   // The rule that came out of three instances: unref() belongs on a timer nobody is waiting for —
   // a poll tick, a force-exit bomb — never on one whose expiry is what a promise resolves on.
