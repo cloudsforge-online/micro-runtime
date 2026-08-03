@@ -28,7 +28,7 @@ import { test, mock } from 'node:test'
 import assert from 'node:assert/strict'
 import { SignJWT, exportJWK, generateKeyPair, type JWK } from 'jose'
 import { AUDIENCE, Verifier, statusFor } from './index.ts'
-import { ServiceTokenProvider, ServiceTokenUnavailableError } from './serviceToken.ts'
+import { ServiceTokenProvider, ServiceTokenUnavailableError, serviceTokenProbe } from './serviceToken.ts'
 
 const ISSUER = 'https://identity.test'
 const IDENTITY = 'http://identity:4000'
@@ -599,6 +599,39 @@ test('a narrower scope set is asked for when the caller knows better', async (t)
   })
   await wide.token()
   assert.equal(defaultBody, '{}')
+})
+
+/* ── the readiness probe ─────────────────────────────────────────────────────────────────────── */
+
+test('the probe fails for a missing credential and only WARNS for an identity outage', async (t) => {
+  const world = await estate()
+  t.after(releaseClock)
+  clockAt(0)
+
+  // A deployment nobody gave a credential to. Deterministic, will not fix itself, so the replica
+  // must not take traffic.
+  assert.deepEqual(await serviceTokenProbe(null).check(), {
+    state: 'fail',
+    detail: 'no service credential is configured',
+  })
+
+  // Configured but idle: the provider mints on first use, so holding nothing is correct.
+  const provider = providerFor(world)
+  assert.equal((await serviceTokenProbe(provider).check()).state, 'pass')
+
+  await provider.token()
+  assert.equal((await serviceTokenProbe(provider).check()).state, 'pass')
+
+  // Identity is down and the token has expired. This is the case where a `fail` would remove every
+  // replica of every service from its balancer at once — a cascade out of one service's bad
+  // minute. It warns instead, and says why.
+  world.identityDown = true
+  clockAt((SERVICE_TTL_SECONDS + 60) * 1000)
+  await provider.token().catch(() => {})
+  const outage = await serviceTokenProbe(provider).check()
+  assert.equal(outage.state, 'warn', 'an identity outage must not be a hard readiness failure')
+  assert.match(outage.detail ?? '', /no live service token/)
+  assert.equal(outage.detail?.includes('cfsc_'), false, 'the credential must not reach an operator-visible detail')
 })
 
 test('the credential is sent in the Authorization header and never in the URL', async (t) => {

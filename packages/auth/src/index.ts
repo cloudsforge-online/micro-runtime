@@ -28,6 +28,7 @@ export {
   CREDENTIAL_PREFIX,
   ServiceTokenProvider,
   ServiceTokenUnavailableError,
+  serviceTokenProbe,
   type ExchangedToken,
   type ProviderEvent,
   type ProviderSnapshot,

@@ -467,6 +467,55 @@ function readExchange(payload: unknown): ExchangedToken {
   }
 }
 
+/**
+ * A readiness probe for the credential, shaped for `@cloudsforge/lifecycle` without importing it.
+ *
+ * The return type is `Probe` structurally — `{ name, kind, check }` — so this package stays
+ * dependency-free and `lifecycle.addProbe(serviceTokenProbe(provider))` still type-checks. Six
+ * services need exactly this check; six hand-written copies is how `obs.ts` ended up byte-identical
+ * in five repositories and divergent in a sixth.
+ *
+ * **It fails for one reason only: no credential is configured.** That is a deployment that is
+ * wrong and will stay wrong until someone changes it, so taking the replica out of the balancer is
+ * right and the operator gets a named check instead of a wall of 503s.
+ *
+ * An identity outage returns `warn`, never `fail`. `fail` on a hard probe would remove EVERY
+ * replica of EVERY service from its balancer the moment identity had a bad minute — a cascade
+ * triggered by the one service the estate can least afford to amplify a fault in. The tokens
+ * already held keep working; the warn is what says so out loud.
+ *
+ * It deliberately does not dial identity. A probe that did would multiply the estate's readiness
+ * traffic by its replica count into a single service, and would answer a question this process can
+ * already answer from what it holds.
+ */
+export function serviceTokenProbe(
+  provider: ServiceTokenProvider | null,
+  options: { readonly name?: string } = {},
+): {
+  readonly name: string
+  readonly kind: 'hard'
+  check(): Promise<{ state: 'pass' | 'warn' | 'fail'; detail?: string }>
+} {
+  return {
+    name: options.name ?? 'identity-credential',
+    kind: 'hard',
+    check: async () => {
+      if (!provider) {
+        return { state: 'fail', detail: 'no service credential is configured' }
+      }
+      const snapshot = provider.snapshot()
+      if (snapshot.hasUsableToken) return { state: 'pass' }
+      if (snapshot.lastFailure) {
+        // The message, never the token and never the credential — `detail` is shown to operators.
+        return { state: 'warn', detail: `no live service token: ${snapshot.lastFailure}` }
+      }
+      // Configured, and nothing has gone wrong: a provider mints on first use, so a service that
+      // has not yet called a peer holding no token is a service that is behaving correctly.
+      return { state: 'pass', detail: 'no token minted yet' }
+    },
+  }
+}
+
 function bearerOf(header: string | null): string | null {
   if (!header) return null
   const match = /^Bearer\s+(.+)$/i.exec(header.trim())
