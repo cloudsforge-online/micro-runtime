@@ -16,8 +16,46 @@
  * Two rules this enforces that are easy to get wrong:
  *
  * 1. **Only idempotent requests are retried by default.** Retrying a POST that debits a wallet
- *    is how a user gets charged twice. A POST is retried only when it carries an idempotency
- *    key, which is what makes the retry safe.
+ *    is how a user gets charged twice. A POST is retried only when it carries an idempotency key.
+ *
+ *    **THE KEY DOES NOT MAKE THE RETRY SAFE. THE RECEIVING ENDPOINT DOES.** This sentence used to
+ *    read "which is what makes the retry safe", and ten caller files across the estate quote that
+ *    claim back as their justification for supplying a key. It is unsound by construction: line
+ *    ~221 infers retry-safety from the CALLER's intent, and the caller's intent is not evidence
+ *    about the server's capability. A keyed POST to an endpoint that ignores the key is retried up
+ *    to three times and takes effect up to three times — and a lost response on a call that
+ *    actually SUCCEEDED is the ordinary case, not an exotic one.
+ *
+ *    Found when `custody`'s `POST /v1/addresses` turned out to read no key at all while `wallet`,
+ *    `mint` and `foresight` were all sending one: the mechanism believed to make the call safe was
+ *    the mechanism manufacturing the duplicate.
+ *
+ *    **So supplying a key is an assertion the caller owes evidence for**, and the evidence is a
+ *    named constraint in the receiving service's schema, not a `src/idempotency.ts` in its tree. A
+ *    filename proves nothing — custody's fix lives in `keys.ts` behind partial unique indexes and
+ *    there is no such file; and a service that has one may still have routes it does not cover.
+ *    The estate was audited endpoint by endpoint and every current target does honour its key:
+ *
+ *      ledger    POST /entries, /reservations, /reservations/:id/release
+ *                  idempotency_keys.key (pk) + journal_entries_idempotency_key_uniq, claim and
+ *                  work in ONE transaction
+ *      custody   POST /v1/addresses          custody_keys_idempotency_uniq (migration 6) + 23505
+ *      market    POST /v1/listings           listings_idempotency_uniq (migration 12) + 23505
+ *      community POST /v1/communities        idempotency_keys.key (pk), tx threaded
+ *      indexer   POST /v1/watch/…            naturally idempotent: upsert on the pk
+ *      worlds    POST /v1/titles/:id/achievements/unlock
+ *                  naturally idempotent: on conflict do nothing on the pk, and the outbox emit is
+ *                  skipped on the duplicate
+ *
+ *    **This behaviour was deliberately NOT changed.** Refusing to retry keyed POSTs would be the
+ *    sound rule in the abstract, but it would strip retries from calls whose loss has documented
+ *    consequences ("a lost response would strand an order that has already paid") to fix nothing
+ *    that is currently broken — and every alternative that looks sounder, such as a
+ *    `retryKeyedPosts` flag, only moves the same unverifiable assertion further from its evidence.
+ *    A server cannot advertise support before the request that would carry the advertisement. The
+ *    obligation therefore sits with the caller, and it is written down here rather than enforced,
+ *    because the thing that must be true is true in another repository.
+ *
  * 2. **A deadline is absolute, not per-attempt.** Retries spend the same budget as the first
  *    attempt, so `deadlineMs` is a real ceiling on wall-clock time.
  */
