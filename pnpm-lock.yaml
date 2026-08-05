@@ -40,6 +40,8 @@ importers:
 
   packages/lifecycle: {}
 
+  packages/secrets: {}
+
   packages/telemetry:
     dependencies:
       '@opentelemetry/api':

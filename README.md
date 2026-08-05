@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/cloudsforge-online/micro-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/cloudsforge-online/micro-runtime/actions/workflows/ci.yml) [![TypeScript](https://img.shields.io/badge/TypeScript-strict%20ESM-3178C6?logo=typescript&logoColor=white)](./tsconfig.base.json) [![node](https://img.shields.io/badge/node-%3E%3D22-5FA04E?logo=nodedotjs&logoColor=white)](./package.json) [![licence](https://img.shields.io/badge/licence-MIT-blue)](./LICENSE)
 
-The six packages every CloudsForge service depends on. They exist because the estate currently
+The seven packages every CloudsForge service depends on. They exist because the estate currently
 carries the same code by hand in every repository:
 
 - `src/obs.ts` — **375 lines, byte-identical in five services** (md5 `2fcb6c10…`), plus a
@@ -26,6 +26,7 @@ Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github
 | `@cloudsforge/db` | Five boot-time DDL arrays | needs `postgres` |
 | `@cloudsforge/auth` | Five divergent JWKS middlewares | needs `jose` |
 | `@cloudsforge/telemetry` | Six copies of `obs.ts` | needs OTel |
+| `@cloudsforge/secrets` | Twenty-five private `requiredSecret` copies, each a deny-list of exact strings | ✅ |
 
 ## The rules these encode
 
