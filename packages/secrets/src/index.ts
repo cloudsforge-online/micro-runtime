@@ -351,6 +351,29 @@ export function assertServiceCredential(name: string, value: string): void {
   }
 
   const body = match[1] ?? ''
+
+  // THE PREFIX IS NOT A CREDENTIAL. This check was missing when this function was promoted out of
+  // ledger, and its absence was a hole: `cfsc_` + a long enough, high enough entropy PLACEHOLDER
+  // cleared every other rule here and would have booted a real service. The other two assertions
+  // in this file have always run the marker list; the one guarding the value a service presents as
+  // its own identity was the one that did not.
+  //
+  // It is not hypothetical. A CI workflow in this estate was written against exactly that hole,
+  // setting `cfsc_ci-only-NOT-a-real-credential-…` because it passed — a placeholder wearing the
+  // shape of the fix. The markers are checked on the BODY, after the prefix is stripped, so the
+  // literal `cfsc_` cannot itself trip a future marker.
+  const flat = normalise(body)
+  for (const marker of SECRET_MARKERS) {
+    if (flat.includes(marker)) {
+      throw new SecretError(
+        `${name} carries the 'cfsc_' prefix but reads as a placeholder (it contains ` +
+          `'${marker}') — the prefix is not the credential. ${fix}`,
+      )
+    }
+  }
+  if (PLACEHOLDERS.has(body.toLowerCase())) {
+    throw new SecretError(`${name} is the 'cfsc_' prefix on a known placeholder — ${fix}`)
+  }
   // BYTES of key material, not keystrokes. base64url carries 6 bits per character, and the unit a
   // 24-character minimum was reaching for was never characters.
   const bytes = Math.floor((body.length * 6) / 8)

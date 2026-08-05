@@ -359,3 +359,25 @@ test('a rotation list applies the full rule to the OUTGOING key too', () => {
     'the message must name the INDEX, and must not carry the entry',
   )
 })
+
+test('a cfsc_ prefix on a placeholder is refused — the prefix is not the credential', () => {
+  // This hole was real: when `assertServiceCredential` was promoted out of ledger it carried no
+  // marker check, so a placeholder wearing the right prefix cleared every other rule and would
+  // have booted a real service. A CI workflow in this estate was written against exactly that
+  // hole. The markers are checked on the BODY, after the prefix is stripped.
+  for (const body of [
+    'ci-only-NOT-a-real-credential-1234567890XYZ',
+    'estate-only-placeholder-credential-00000000',
+    'this-is-a-changeme-credential-000000000000',
+  ]) {
+    assert.throws(
+      () => assertServiceCredential('ADMIN_API_SERVICE_TOKEN', `cfsc_${body}`),
+      (err: unknown) => err instanceof SecretError && !err.message.includes(body),
+      `cfsc_${body.slice(0, 12)}… must be refused without echoing the value`,
+    )
+  }
+
+  // And the real shapes still pass — the markers must not have made the guard trigger-happy.
+  assert.doesNotThrow(() => assertServiceCredential('C', MAINNET_CREDENTIAL))
+  assert.doesNotThrow(() => assertServiceCredential('C', TESTNET_CREDENTIAL))
+})
