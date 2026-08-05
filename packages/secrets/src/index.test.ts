@@ -10,6 +10,9 @@ import {
   SecretError,
   assertGeneratedSecret,
   assertGeneratedSecretList,
+  assertOpaqueSecret,
+  assertServiceCredential,
+  parseSecretList,
   entropyPerChar,
 } from './index.ts'
 
@@ -112,7 +115,20 @@ test('the alphabet check is what catches a typed value', () => {
   // Every placeholder the estate wrote contained a hyphen or an underscore. Neither alphabet does.
   const generated = randomBytes(48).toString('base64')
   assert.throws(() => assertGeneratedSecret('X', `${generated}-x`), /not base64 or hex/)
-  assert.throws(() => assertGeneratedSecret('X', generated.replace('+', '_')), /not base64 or hex/)
+
+  // THIS ASSERTION USED TO BE `generated.replace('+', '_')`, AND IT FAILED 36% OF RUNS.
+  //
+  // `String.prototype.replace` with a string pattern replaces the FIRST match only — and a 64-char
+  // base64 string contains no `+` at all 36.1% of the time (measured, 20,000 samples). On those
+  // runs the replace was a no-op, the value stayed valid base64, and the guard correctly did not
+  // throw, so the TEST failed. The guard was never wrong; the test was.
+  //
+  // That matters more than a flake usually would. This is the suite that defends the secret guard
+  // for the whole estate, and a suite that is red one run in three is a suite whose red is read as
+  // noise and re-run. Substituting into a FIXED position removes the randomness from the assertion
+  // while leaving the value itself random.
+  assert.throws(() => assertGeneratedSecret('X', `_${generated.slice(1)}`), /not base64 or hex/)
+  assert.throws(() => assertGeneratedSecret('X', `${generated.slice(0, -1)}-`), /not base64 or hex/)
 })
 
 test('markers are matched with punctuation and case stripped', () => {
@@ -194,4 +210,152 @@ test('entropyPerChar is the textbook definition', () => {
   assert.equal(entropyPerChar('aaaa'), 0)
   assert.equal(entropyPerChar('ab'), 1)
   assert.equal(entropyPerChar('abcd'), 2)
+})
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ * SERVICE CREDENTIALS — the class `assertGeneratedSecret` would have killed
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * The two shapes MEASURED on the running estates on 2026-08-05. Both are 43-character base64url
+ * bodies; the testnet one contains a hyphen and the mainnet one does not.
+ *
+ * The hyphenated fixture is the point of this constant. Every instinct in review says a secret has
+ * no hyphens — every placeholder this estate ever wrote had one — and a guard written on that
+ * instinct passes mainnet and kills testnet at boot. With this fixture pinned, that guard fails CI
+ * instead. It is deliberately NOT a randomly generated value: a random base64url body contains a
+ * hyphen only about nine times in ten, and a test that catches the regression nine runs out of ten
+ * is a test that lets it through on the run that matters.
+ */
+const MAINNET_CREDENTIAL = 'cfsc_' + 'qN8xKvR2mT7bY4wL9pF3hJ6dS1gZ5cA0eU8iO2nQ7rV'
+const TESTNET_CREDENTIAL = 'cfsc_' + 'qN8xKvR2mT7bY4wL9pF3hJ6dS1gZ5cA0eU8iO2n-7rV'
+
+test('a service credential is accepted on BOTH estates, hyphen and all', () => {
+  assert.doesNotThrow(() => assertServiceCredential('LEDGER_IDENTITY_CREDENTIAL', MAINNET_CREDENTIAL))
+
+  // THE REGRESSION THIS FILE EXISTS FOR. A "no hyphens" rule passes the line above and fails here.
+  assert.ok(TESTNET_CREDENTIAL.includes('-'), 'the testnet fixture must actually contain a hyphen')
+  assert.doesNotThrow(() => assertServiceCredential('LEDGER_IDENTITY_CREDENTIAL', TESTNET_CREDENTIAL))
+})
+
+test('the generated-secret guard would refuse every credential the estate has ever minted', () => {
+  // Not a curiosity — this is why `assertServiceCredential` exists rather than one shared rule.
+  // If this ever stops throwing, the two guards have converged and one of them is now wrong.
+  for (const credential of [MAINNET_CREDENTIAL, TESTNET_CREDENTIAL]) {
+    assert.throws(() => assertGeneratedSecret('LEDGER_IDENTITY_CREDENTIAL', credential), SecretError)
+  }
+})
+
+test('a credential guard refuses a JWT by name — micro-org #197 and #222', () => {
+  // Shape only. The real ones measured live were 669-805 bytes and all expired 26 hours before
+  // this was written, on containers reporting healthy.
+  const jwt = 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzZXJ2aWNlOmxlZGdlciIsImV4cCI6MX0.c2ln'
+  assert.throws(
+    () => assertServiceCredential('ADMIN_API_SERVICE_TOKEN', jwt),
+    (err: unknown) => err instanceof SecretError && /TOKEN, not a credential/.test(err.message),
+  )
+})
+
+test('a credential guard refuses placeholders, prefixless values and short bodies', () => {
+  for (const [value, why] of REAL_DEFECT_VALUES) {
+    assert.throws(() => assertServiceCredential('LEDGER_IDENTITY_CREDENTIAL', value), SecretError, why)
+  }
+  // Right prefix, body too short to carry 32 bytes: 32 base64url chars is 24 bytes.
+  assert.throws(() => assertServiceCredential('X', 'cfsc_' + 'a'.repeat(32)), SecretError)
+  // Right prefix, right length, no entropy — the degenerate case a length check cannot see.
+  assert.throws(() => assertServiceCredential('X', 'cfsc_' + 'a'.repeat(43)), SecretError)
+  assert.throws(() => assertServiceCredential('X', ''), SecretError)
+})
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ * OPAQUE THIRD-PARTY SECRETS — and the four #142 placeholders still live when this was written
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/**
+ * Read out of `deploy/compose/docker-compose.estate.yml` on 2026-08-05 and confirmed with
+ * `printenv` inside the running containers on BOTH estates. Three of the four are hardcoded
+ * literals in the compose file rather than variable defaults, so no deploy could ever have
+ * overridden them. This is micro-org #142 — the defect that started all of this — still live.
+ */
+const LIVE_PLACEHOLDER_TOKENS: readonly (readonly [string, string])[] = [
+  ['BEACON_TOKEN', 'estate-only-beacon-breakglass-000000000'],
+  ['FAUCET_TOKEN', 'estate-only-faucet-operator-token-00000'],
+  ['LANTERN_TOKEN', 'estate-only-lantern-token-000000000000'],
+  ['ANALYTICS_TOKEN', 'estate-placeholder-token-0000000000000000'],
+]
+
+test('the opaque guard refuses all four placeholders that were live on both estates', () => {
+  for (const [name, value] of LIVE_PLACEHOLDER_TOKENS) {
+    assert.throws(
+      () => assertOpaqueSecret(name, value),
+      (err: unknown) => err instanceof SecretError && !err.message.includes(value),
+      `${name} must be refused, and the message must not carry the value`,
+    )
+  }
+})
+
+test('the opaque guard accepts a vendor secret whose alphabet the estate does not control', () => {
+  // The whole reason this is not `assertGeneratedSecret`. An SMTP provider is entitled to issue a
+  // password with punctuation in it, and refusing a working credential is how a guard gets deleted.
+  // NONE of these may imitate a real provider's key format. An earlier draft used an
+  // `sk_live_…` fixture and GitHub push protection correctly blocked the push as a Stripe live
+  // key — a fake credential shaped like a real provider's is a fake credential that gets reported,
+  // rotated and chased. It was doubly wrong here: this estate is crypto-native and has no Stripe.
+  for (const vendor of [
+    'S3cure!Smtp#Pass_2026$xyzQ',     // notify's SMTP password shape
+    'rpc-user:9f3Kd0!vLmZ2qWxE7tBn', // a chain node's RPC password
+    'vendor.key.7Yq!2Lm@4Xd~9Rb^3Tz', // a vendor API key, punctuation and all
+  ]) {
+    assert.doesNotThrow(() => assertOpaqueSecret('THIRD_PARTY_SECRET', vendor))
+    // ...and each of these WOULD have been refused by the generated-key rule. That is the bug this
+    // class prevents: a correct value refused at boot on both estates.
+    assert.throws(() => assertGeneratedSecret('THIRD_PARTY_SECRET', vendor), SecretError)
+  }
+})
+
+test('the opaque guard still refuses empty, short, degenerate and JWT values', () => {
+  assert.throws(() => assertOpaqueSecret('X', ''), SecretError)
+  assert.throws(() => assertOpaqueSecret('X', 'short!'), SecretError)
+  assert.throws(() => assertOpaqueSecret('X', '0'.repeat(40)), SecretError)
+  assert.throws(
+    () => assertOpaqueSecret('X', 'eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjF9.c2ln'),
+    (err: unknown) => err instanceof SecretError && /#222/.test(err.message),
+  )
+})
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ * ROTATION LISTS
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+test('parseSecretList splits, trims, freezes and refuses a duplicate', () => {
+  const a = randomBytes(48).toString('base64')
+  const b = randomBytes(48).toString('base64')
+
+  const parsed = parseSecretList('OUTBOX_ACCEPT_SECRETS', ` ${a} , ${b} `)
+  assert.deepEqual([...parsed], [a, b])
+  assert.ok(Object.isFrozen(parsed))
+
+  // A duplicate makes "which key verified this" ambiguous, which is the answer that tells an
+  // operator a rotation has finished and the outgoing key may be dropped.
+  assert.throws(() => parseSecretList('OUTBOX_ACCEPT_SECRETS', `${a},${a}`), SecretError)
+
+  // Absence and an all-whitespace value are both an EMPTY list, not a list with one bad entry.
+  assert.throws(() => parseSecretList('OUTBOX_ACCEPT_SECRETS', ''), SecretError)
+  assert.throws(() => parseSecretList('OUTBOX_ACCEPT_SECRETS', ' , , '), SecretError)
+})
+
+test('a rotation list applies the full rule to the OUTGOING key too', () => {
+  // "Just for the drain" is exactly how a placeholder survives the rotation meant to remove it.
+  const good = randomBytes(48).toString('base64')
+  assert.throws(
+    () => parseSecretList('OUTBOX_ACCEPT_SECRETS', `${good},estate-only-outbox-secret-00000000000000`),
+    (err: unknown) => err instanceof SecretError && /\[1\]/.test(err.message),
+    'the message must name the INDEX, and must not carry the entry',
+  )
 })

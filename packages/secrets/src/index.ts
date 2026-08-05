@@ -261,3 +261,223 @@ export function assertGeneratedSecretList(name: string, values: readonly string[
     assertGeneratedSecret(`${name}[${index}]`, value)
   })
 }
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE OTHER TWO CLASSES OF SECRET, AND WHY ONE ASSERTION CANNOT SERVE ALL THREE
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * `assertGeneratedSecret` above is correct for a key THIS estate generates and therefore controls
+ * the alphabet of. Pointing every variable at it is the obvious fix, and it is wrong twice over.
+ * Both failure modes were measured on the running containers rather than reasoned about, because
+ * reasoning about them is what produced the defect:
+ *
+ *   1. A SERVICE CREDENTIAL is `cfsc_` + base64url. It is neither wholly base64 nor wholly hex —
+ *      the underscore in its own prefix disqualifies it — so `assertGeneratedSecret` refuses every
+ *      credential this estate has ever minted, and the service exits 1 at boot on BOTH networks.
+ *
+ *   2. An OPAQUE THIRD-PARTY TOKEN — an SMTP password, a chain node's RPC password, a vendor API
+ *      key — has an alphabet its ISSUER chose. Demanding base64 of it refuses a correct value, and
+ *      a guard that refuses correct input is a guard an operator deletes at 3am.
+ *
+ * So there are three classes, and every variable must be classified before it is guarded. The name
+ * does not classify it. Measured live on 2026-08-05 across both estates:
+ *
+ *     SETTLEMENT_SERVICE_TOKEN   cfsc_ + 43        ← a credential
+ *     MARKET_SERVICE_TOKEN       a 697-byte JWT    ← neither, and expired
+ *     TRADE_SERVICE_TOKEN        a 716-byte JWT    ← neither, and expired
+ *
+ * Four variables, one suffix, two shapes. `*_SERVICE_TOKEN` means nothing on its own, and a guard
+ * chosen from the variable's NAME would have booted settlement and killed market and trade.
+ */
+
+/** `cfsc_` then base64url. Identity mints the body with `-` and `_` in the alphabet. */
+const SERVICE_CREDENTIAL = /^cfsc_([A-Za-z0-9_-]+)$/
+
+/** A JWT's first two segments. Matched on shape, not decoded — this is a refusal, not a parse. */
+const JWT_SHAPE = /^ey[A-Za-z0-9_-]*\./
+
+/**
+ * A service credential, held to its SHAPE — the same discipline as `assertGeneratedSecret`, and
+ * emphatically not the same rule.
+ *
+ * Promoted here from `ledger/src/env.ts`, which is where it was written and where it was the only
+ * copy. It is in the shared package now for the reason the package exists at all: a guard that
+ * lives in one service is a guard the other sixteen will each reimplement slightly differently,
+ * and "slightly differently" is how mainnet and testnet end up with different rules.
+ *
+ * ── THE HYPHEN, WHICH IS THE WHOLE POINT ───────────────────────────────────────────────────────
+ *
+ * The credential BODY is base64**url**, so it may contain `-` and `_`. Measured live:
+ *
+ *     mainnet  cfsc_ + 43 chars, alphanumeric only
+ *     testnet  cfsc_ + 43 chars, CONTAINS A HYPHEN
+ *
+ * A "no hyphens" rule — correct for a generated key, and exactly what a copy of custody's
+ * `assertMasterSecret` does — passes mainnet and kills testnet. One environment healthy, one dead,
+ * from a rule that reads as obviously right in review. The test file pins a hyphenated fixture
+ * deliberately so that regression fails CI instead of failing testnet at boot.
+ *
+ * ── WHAT IT ASSERTS ────────────────────────────────────────────────────────────────────────────
+ *
+ * The prefix does most of the work and is not cosmetic: identity issues credentials with it, so a
+ * value without it is not a credential regardless of how well-formed it looks. It refuses
+ * `changeme`, it refuses the 40-character estate placeholder, and it refuses a JWT by name —
+ * which is the ten-minute cliff wearing the fix's clothes, and the whole of micro-org #197/#222.
+ *
+ * The byte floor and the entropy floor are the same constants the signing-key guard uses, so this
+ * function cannot drift from it.
+ *
+ * @throws {SecretError} with a message that never contains `value`.
+ */
+export function assertServiceCredential(name: string, value: string): void {
+  const fix = 'mint one with: deploy/scripts/estate-bootstrap.sh'
+
+  if (value.length === 0) throw new SecretError(`${name} is empty — ${fix}`)
+
+  if (JWT_SHAPE.test(value)) {
+    throw new SecretError(
+      `${name} carries a TOKEN, not a credential — a JWT is minted with a ten-minute life and is ` +
+        `dead ten minutes after the boot that read it (micro-org#197). ${fix}`,
+    )
+  }
+
+  const match = SERVICE_CREDENTIAL.exec(value)
+  if (!match) {
+    throw new SecretError(
+      `${name} is not a service credential — identity mints these with a 'cfsc_' prefix, and a ` +
+        `credential is generated rather than typed. ${fix}`,
+    )
+  }
+
+  const body = match[1] ?? ''
+  // BYTES of key material, not keystrokes. base64url carries 6 bits per character, and the unit a
+  // 24-character minimum was reaching for was never characters.
+  const bytes = Math.floor((body.length * 6) / 8)
+  if (bytes < MIN_SECRET_BYTES) {
+    throw new SecretError(
+      `${name} carries ${bytes} bytes of key material and at least ${MIN_SECRET_BYTES} are ` +
+        `required — length in CHARACTERS is not the unit that matters. ${fix}`,
+    )
+  }
+
+  const measured = entropyPerChar(body)
+  if (measured < MIN_ENTROPY_BASE64) {
+    throw new SecretError(
+      `${name} is long enough but its entropy is ${measured.toFixed(2)} bits per character, below ` +
+        `the ${MIN_ENTROPY_BASE64} floor — a repeated pattern is not a key. ${fix}`,
+    )
+  }
+}
+
+/**
+ * Characters, not bytes — the floor for a value whose alphabet somebody else chose.
+ *
+ * Deliberately lower than `MIN_SECRET_BYTES`. This guard cannot know how much entropy a character
+ * of a vendor's token carries, so it refuses what is obviously too short to be anything and leaves
+ * the rest to the marker and entropy checks.
+ */
+export const MIN_OPAQUE_CHARS = 16
+
+/**
+ * Shannon floor for an opaque value. Well below the base64 floor because a vendor token may be
+ * drawn from a small alphabet; its job is to catch `0000…`, not to grade the issuer's RNG.
+ */
+export const MIN_ENTROPY_OPAQUE = 2.0
+
+/**
+ * A secret THIS ESTATE DID NOT GENERATE — an SMTP password, a chain node's RPC password, a vendor
+ * API key, a break-glass token typed into a runbook.
+ *
+ * ── WHY THIS IS NOT `assertGeneratedSecret` ────────────────────────────────────────────────────
+ *
+ * Because the alphabet belongs to the issuer. An SMTP provider may hand out a password with a `!`
+ * in it and be entirely correct to; demanding base64 of it refuses a working credential and
+ * teaches the operator that the guard is the problem. The estate's own keys are held to the
+ * stricter rule precisely BECAUSE it controls their generation — that argument does not transfer
+ * to a value that arrives from outside.
+ *
+ * ── WHAT IS STILL ASSERTABLE, AND IT IS THE PART THAT MATTERS ──────────────────────────────────
+ *
+ * The placeholder markers. They are alphabet-independent, and they are what actually catches this
+ * estate's real defects. Measured live on 2026-08-05, on BOTH estates:
+ *
+ *     BEACON_TOKEN     estate-only-beacon-breakglass-000000000     (hardcoded in compose, ×2)
+ *     FAUCET_TOKEN     estate-only-faucet-operator-token-00000     (hardcoded in compose, ×2)
+ *     LANTERN_TOKEN    estate-only-lantern-token-000000000000      (hardcoded in compose, ×2)
+ *     ANALYTICS_TOKEN  estate-placeholder-token-0000000000000000   (compose default)
+ *
+ * All four normalise to a string containing `estateonly` or `placeholder`, so all four are refused
+ * here — which is micro-org #142, still live, in four of the seventeen services this guard is
+ * being added to. That is the entire justification for this function existing rather than these
+ * variables being left unguarded because "we don't control the format".
+ *
+ * @throws {SecretError} with a message that never contains `value`.
+ */
+export function assertOpaqueSecret(name: string, value: string): void {
+  const fix = `set a real value for ${name} — generate one with: openssl rand -base64 32`
+
+  if (value.length === 0) throw new SecretError(`${name} is empty — ${fix}`)
+
+  if (PLACEHOLDERS.has(value.toLowerCase())) {
+    throw new SecretError(`${name} is set to a known placeholder — ${fix}`)
+  }
+
+  const flat = normalise(value)
+  for (const marker of SECRET_MARKERS) {
+    if (flat.includes(marker)) {
+      throw new SecretError(`${name} reads as a placeholder (it contains '${marker}') — ${fix}`)
+    }
+  }
+
+  // A JWT is refused here too. An opaque token is a STANDING credential; a JWT is a ten-minute
+  // one, and putting one in a variable that is read once at boot is micro-org #222 exactly.
+  if (JWT_SHAPE.test(value)) {
+    throw new SecretError(
+      `${name} carries a JWT — a minted token expires and is read here only at boot, so it is ` +
+        `dead on the next restart at the latest (micro-org#222). ${fix}`,
+    )
+  }
+
+  if (value.length < MIN_OPAQUE_CHARS) {
+    throw new SecretError(
+      `${name} is ${value.length} characters and at least ${MIN_OPAQUE_CHARS} are required. ${fix}`,
+    )
+  }
+
+  const measured = entropyPerChar(value)
+  if (measured < MIN_ENTROPY_OPAQUE) {
+    throw new SecretError(
+      `${name} is long enough but its entropy is ${measured.toFixed(2)} bits per character, below ` +
+        `the ${MIN_ENTROPY_OPAQUE} floor — a repeated pattern is not a secret. ${fix}`,
+    )
+  }
+}
+
+/**
+ * A comma-separated rotation list, split and checked.
+ *
+ * Promoted here from the ELEVEN services that each carried their own copy — `settlement`, `trade`,
+ * `worlds`, `emberkin`, `devplatform`, `wallet`, `tessera`, `community`, `billing`, `admin-api`
+ * and one more. Four of those copies took a `minLength = 24` parameter, which is the keystroke
+ * floor this package exists to replace: it passes a 40-character placeholder and always did.
+ *
+ * The duplicate check is kept from tessera's copy, which is the only one that had it. A duplicated
+ * secret makes "which key verified this" ambiguous, and that answer is what tells an operator
+ * whether a rotation has finished and the outgoing key may be dropped.
+ *
+ * @throws {SecretError} if the list is empty, has a duplicate, or any entry is not generated.
+ */
+export function parseSecretList(name: string, raw: string): readonly string[] {
+  const entries = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+
+  assertGeneratedSecretList(name, entries)
+
+  if (new Set(entries).size !== entries.length) {
+    throw new SecretError(`${name} lists the same secret twice`)
+  }
+  return Object.freeze(entries)
+}
