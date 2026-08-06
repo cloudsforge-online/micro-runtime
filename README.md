@@ -53,14 +53,14 @@ See `docs/ecosystem/02-target-architecture.md` AD-17 and AD-20.
 The most important thing in this repository to understand before changing anything, because the
 estate has already been broken by getting it wrong.
 
-`micro-identity` issues service tokens with a TTL of **600 seconds** (`identity/src/tokens.ts:28`).
+`micro-identity` issues service tokens with a TTL of **600 seconds** (`identity/src/tokens.ts`).
 That short lifetime is a deliberate security property: rotation IS expiry, which is why no
 revocation list for service tokens exists anywhere. It is not a limitation to be worked around.
 
 Every service used to read its token once, from an environment variable, at boot:
 
 ```ts
-const token = () => env.serviceToken      // wallet/src/index.ts:90, and eight more like it
+const token = () => env.serviceToken      // wallet/src/index.ts, and eight more like it
 ```
 
 Nothing re-minted it — nothing *could*, because `POST /service-tokens` requires the `admin` role,

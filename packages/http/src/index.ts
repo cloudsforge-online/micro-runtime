@@ -3,7 +3,7 @@
  *
  * What this replaces, and why each part is here:
  *
- * - **Nimbus's two admin proxies call bare `fetch`** (`routes/vault.ts:61`, `routes/pay.ts:73`).
+ * - **Nimbus's two admin proxies call bare `fetch`** (`routes/vault.ts`, `routes/pay.ts`).
  *   On undici there is no total-request timeout by default, so a hung ForgeKeyvault pins the
  *   identity service indefinitely — a denial of service on authentication for the whole estate,
  *   reachable by making one downstream slow. It is the worst call in the current codebase, in

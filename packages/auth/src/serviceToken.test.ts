@@ -35,7 +35,7 @@ const IDENTITY = 'http://identity:4000'
 const PEER = 'http://ledger:4000/entries'
 const SERVICE = 'wallet'
 
-/** identity/src/tokens.ts:28. Not a knob — see the header of serviceToken.ts. */
+/** identity/src/tokens.ts. Not a knob — see the header of serviceToken.ts. */
 const SERVICE_TTL_SECONDS = 600
 
 /* ── the simulated clock ────────────────────────────────────────────────────────────────────── */
@@ -133,7 +133,7 @@ async function estate(options: { ttlSeconds?: number } = {}): Promise<Estate> {
           return new Response('{"error":"unauthenticated"}', { status: 401 })
         }
         self.exchanges += 1
-        // identity/src/server.ts:1402 — the fields the provider reads.
+        // identity/src/server.ts — the fields the provider reads.
         return new Response(
           JSON.stringify({
             token: await signToken(ttl),

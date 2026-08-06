@@ -83,7 +83,7 @@ create table if not exists schema_migrations (
  * A 64-bit advisory lock key derived from the service name.
  *
  * **Prior art, and why this differs from it.** Nimbus already solved this, and solved it well:
- * `platform/services/nimbus/src/db/migrate.ts:188-194` takes `pg_advisory_xact_lock` with a
+ * `platform/services/nimbus/src/db/migrate.ts` takes `pg_advisory_xact_lock` with a
  * comment explaining the choice of the transaction-scoped form because it is released
  * automatically, even if the process dies mid-migration. That is the better choice when every
  * migration is transactional, and it is the reason Nimbus is the one service in the estate that

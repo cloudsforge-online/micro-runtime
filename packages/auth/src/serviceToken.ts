@@ -3,10 +3,10 @@
  *
  * ── THE DEFECT ────────────────────────────────────────────────────────────────────────────────
  *
- * Service tokens expire in 600 seconds (`identity/src/tokens.ts:28`). Every service in the estate
+ * Service tokens expire in 600 seconds (`identity/src/tokens.ts`). Every service in the estate
  * read its token once, from an environment variable, at boot:
  *
- *     const token = () => env.serviceToken      // wallet/src/index.ts:90, and eight more like it
+ *     const token = () => env.serviceToken      // wallet/src/index.ts, and eight more like it
  *
  * Nothing re-minted it, so the estate worked perfectly in every test and for the first ten minutes
  * of any real deployment, after which every service-to-service call began failing. No per-service

@@ -42,7 +42,7 @@
  *      has no punctuation to catch it on, and (2) and (3) would pass it at enough length.
  *
  * The floors, the marker list and the ordering are ported from `micro-custody`'s
- * `assertMasterSecret` (`custody/src/env.ts:196-238`), which is the only place in the estate that
+ * `assertMasterSecret` (`custody/src/env.ts`), which is the only place in the estate that
  * got this right. Custody's copy predates this package and still holds its own; folding it in is
  * micro-org #143.
  *
