@@ -134,6 +134,17 @@ export class JobQueue {
     this.#maxAttempts = options.maxAttempts ?? 5
   }
 
+  /**
+   * The lease this queue hands out, in milliseconds.
+   *
+   * Exposed so `JobRunner` can derive a renewal interval from it rather than being told the same
+   * number twice. Two places holding one lease duration is two places to get it wrong, and the
+   * failure mode of getting it wrong is a job running in two processes at once.
+   */
+  get leaseMs(): number {
+    return this.#leaseMs
+  }
+
   async enqueue(options: EnqueueOptions): Promise<void> {
     const runAt = options.runAt ?? new Date()
     const payload = options.payload ?? {}
@@ -288,6 +299,11 @@ export interface RunnerOptions {
   /** Maximum jobs in flight in this process. */
   readonly concurrency?: number
   readonly pollMs?: number
+  /**
+   * How often an in-flight job's lease is renewed. Defaults to a third of the queue's lease, which
+   * survives two consecutive failed renewals before the lease lapses. Rarely worth setting.
+   */
+  readonly heartbeatMs?: number
   /** Consulted before every claim. Wire it to Lifecycle.claimingJobs so a drain stops new work. */
   readonly shouldClaim?: () => boolean
   readonly onEvent?: (event: RunnerEvent) => void
@@ -310,6 +326,44 @@ export interface RunnerEvent {
  * Deliberately a poller rather than a listener. `LISTEN/NOTIFY` would cut latency and would also
  * introduce a connection whose loss silently stops all work; polling degrades to "slower" rather
  * than "stopped", which is the correct failure mode for a queue that moves money.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **THE POLL IS NOT ALLOWED TO WAIT FOR THE WORK.** `#poll` claims and dispatches; it does not
+ * await the handlers it started. This is the single most important property of the class and it
+ * was learned the hard way.
+ *
+ * On 2026-08-08 the mainnet indexer claimed `indexer.follow ltc:mainnet` and
+ * `indexer.backfill ltc:mainnet` in one batch at 18:03:18, after litecoind came back from an
+ * outage. `follow` then ran for **twelve minutes and thirty-five seconds** catching the node up
+ * (`followed blocks:24 tip:3156428`), and its batch partner ran longer still. The version of this
+ * class that shipped that day ended its poll with `await Promise.all(jobs.map(run))` and scheduled
+ * the next poll in `.finally()` — so for those sixteen minutes the process claimed nothing at all.
+ * `outbox.relay`, due at 18:03:19, was never picked up; a confirmed deposit sat in the outbox with
+ * `published_at = NULL` and not one row in `outbox_deliveries`; `estate-verify` reported "no
+ * contract-signed delivery reached wallet's inbox". Restarting the container delivered it in
+ * seconds. micro-org#261.
+ *
+ * Two things to keep in mind before changing anything here:
+ *
+ *   - **A slow handler must cost its own kind and nothing else.** Chain jobs run long exactly when
+ *     a node is catching up after downtime, which is exactly when there is a backlog of real
+ *     deposits to credit. Coupling the poll to the work inverts that: the estate stops delivering
+ *     money events at the only moment it has a queue of them.
+ *   - **`#inFlight` is what bounds concurrency now, and it only started meaning anything once the
+ *     poll stopped waiting.** Under the old shape `capacity = concurrency - #inFlight` could only
+ *     ever read `concurrency`, because the poll never returned while a job was in flight. The
+ *     limit applied within a claim batch and nowhere else.
+ *
+ * **Unblocking the loop uncovers a second bug, so the two fixes ship together.** The claim
+ * predicate takes any row whose `locked_until` has passed. A twelve-minute handler under a
+ * two-minute lease has an expired lease for ten of those minutes, so a poll that is no longer
+ * blocked would re-claim the job this very process is still running — the double-processing the
+ * package exists to prevent. Hence `#renew`: an in-flight job's lease is extended automatically,
+ * on a timer, whether or not its handler ever calls `heartbeat`. `QueueOptions.leaseMs` says it
+ * "must exceed the longest expected run of the slowest handler"; for a backfill that number is set
+ * by how far behind the chain is, so nobody can pick it in advance and automatic renewal is the
+ * only reading of that rule anyone can actually satisfy.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 export class JobRunner {
   readonly #handlers = new Map<string, Handler<never>>()
@@ -320,12 +374,20 @@ export class JobRunner {
   #stopping = false
   #claiming = false
   #abort = new AbortController()
+  /** Job ids running in this process. The last line of defence against dispatching one twice. */
+  readonly #running = new Set<string>()
+  /** One entry per in-flight handler, removed as it settles. `tick` and `stop` wait on these. */
+  readonly #pending = new Set<Promise<void>>()
 
   constructor(options: RunnerOptions) {
     this.#o = {
       queue: options.queue,
       concurrency: options.concurrency ?? 4,
       pollMs: options.pollMs ?? 1_000,
+      // A third of the lease: two renewals may be lost — a database blip, a paused event loop —
+      // before the lease actually lapses. Floored at a second so a short lease in a test does not
+      // turn into a renewal storm.
+      heartbeatMs: options.heartbeatMs ?? Math.max(1_000, Math.floor(options.queue.leaseMs / 3)),
       random: options.random ?? Math.random,
       ...(options.onEvent ? { onEvent: options.onEvent } : {}),
       ...(options.shouldClaim ? { shouldClaim: options.shouldClaim } : {}),
@@ -346,8 +408,10 @@ export class JobRunner {
     if (this.#timer) return
     this.#stopping = false
     this.#abort = new AbortController()
+    // `#poll`, not `tick`: the next poll is scheduled once the *claim* has settled, not once the
+    // work has. See the class docblock — waiting for the work here is micro-org#261.
     const loop = () => {
-      void this.tick().finally(() => {
+      void this.#poll().finally(() => {
         if (!this.#stopping) {
           this.#timer = setTimeout(loop, this.#o.pollMs)
           this.#timer.unref?.()
@@ -358,12 +422,26 @@ export class JobRunner {
     this.#timer.unref?.()
   }
 
-  /** One poll. Exposed so tests drive the runner deterministically instead of sleeping. */
+  /**
+   * One poll, run to completion.
+   *
+   * Exposed so tests drive the runner deterministically instead of sleeping, which is why this —
+   * unlike the loop in `start` — waits for the handlers it dispatched. Production does not use it.
+   * It settles *every* in-flight handler, not only this poll's, so a test that calls it twice sees
+   * a quiet runner both times.
+   */
   async tick(): Promise<number> {
+    const claimed = await this.#poll()
+    while (this.#pending.size > 0) await Promise.all([...this.#pending])
+    return claimed
+  }
+
+  /** Claim what there is capacity for and start it. Returns without waiting for any of it. */
+  async #poll(): Promise<number> {
     if (this.#stopping) return 0
     if (this.#o.shouldClaim && !this.#o.shouldClaim()) return 0
 
-    // Only one claim may be in flight per process. Without this, two overlapping ticks each read
+    // Only one claim may be in flight per process. Without this, two overlapping polls each read
     // `inFlight` before either has started a handler, both see full capacity, and the process
     // runs 2× concurrency. The database lease still prevents two *workers* taking one job; this
     // guard is what stops one worker exceeding its own limit.
@@ -382,7 +460,26 @@ export class JobRunner {
       this.#claiming = false
     }
 
-    await Promise.all(jobs.map((job) => this.#run(job)))
+    for (const job of jobs) {
+      // Only reachable if a renewal was lost long enough for the lease to lapse under a running
+      // handler. Running it a second time in the same process is the one outcome worth ruling out
+      // absolutely, so the duplicate claim is dropped on the floor and said out loud. The row is
+      // left alone: the run already in flight owns it and will complete or fail it. The claim has
+      // cost the job an attempt, and that is the cheaper half of the trade.
+      if (this.#running.has(job.id)) {
+        this.#emit({
+          type: 'error',
+          kind: job.kind,
+          key: job.key,
+          jobId: job.id,
+          error: 'claimed a job this process is already running — its lease lapsed mid-handler',
+        })
+        continue
+      }
+      const run = this.#run(job)
+      this.#pending.add(run)
+      void run.finally(() => this.#pending.delete(run))
+    }
     return jobs.length
   }
 
@@ -396,13 +493,28 @@ export class JobRunner {
     }
 
     this.#inFlight += 1
+    this.#running.add(job.id)
     const startedAt = Date.now()
     this.#emit({ type: 'claimed', kind: job.kind, key: job.key, jobId: job.id, attempts: job.attempts })
+
+    // The lease is now this runner's problem rather than the handler's. A handler may still call
+    // `ctx.heartbeat()` and nothing breaks if it does; it simply no longer has to remember.
+    //
+    // Rule 8 — background work is a leased job — is what this timer *implements*, and it is the one
+    // timer in the estate that cannot itself be a leased job without infinite regress: something
+    // has to hold the lease open while the job holding it runs. It does no domain work, touches no
+    // table but `jobs.locked_until`, lives exactly as long as one handler, and is unref'd so it
+    // never keeps the process alive.
+    const lease = new AbortController()
+    const renew = setInterval(() => void this.#renew(job, lease), this.#o.heartbeatMs) // cfctl-allow setInterval: renews the lease of the job it belongs to; see above
+    renew.unref?.()
 
     try {
       await (handler as Handler)(job, {
         heartbeat: () => this.#o.queue.heartbeat(job.id),
-        signal: this.#abort.signal,
+        // Either the process is draining or this job's lease was taken from under it. A handler
+        // that honours the signal stops writing in both cases, which is the same instruction.
+        signal: AbortSignal.any([this.#abort.signal, lease.signal]),
       })
       await this.#o.queue.complete(job.id)
       this.#emit({
@@ -426,8 +538,37 @@ export class JobRunner {
         error: messageOf(err),
       })
     } finally {
+      clearInterval(renew)
+      this.#running.delete(job.id)
       this.#inFlight -= 1
     }
+  }
+
+  /**
+   * Extend one in-flight job's lease.
+   *
+   * A renewal that *throws* is not evidence of anything — a database blip is not a lost lease, and
+   * failing a twelve-minute backfill over one refused connection would be its own defect. The next
+   * renewal finds out. A renewal that cleanly returns `false` is different: the row is gone or
+   * `locked_by` is no longer us, so another worker may already be doing this work, and the only
+   * safe instruction is to stop writing.
+   */
+  async #renew(job: Job, lease: AbortController): Promise<void> {
+    let held: boolean
+    try {
+      held = await this.#o.queue.heartbeat(job.id)
+    } catch {
+      return
+    }
+    if (held || lease.signal.aborted) return
+    this.#emit({
+      type: 'error',
+      kind: job.kind,
+      key: job.key,
+      jobId: job.id,
+      error: 'lost this job’s lease while its handler was still running',
+    })
+    lease.abort(new Error(`lease lost for ${job.kind}/${job.key}`))
   }
 
   /** Stop claiming, then wait for in-flight handlers. Call from a Lifecycle shutdown hook. */

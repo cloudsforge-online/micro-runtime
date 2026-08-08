@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/jobs",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A leased job table over Postgres. Replaces eight setInterval timers guarded by module-local booleans.",
   "license": "MIT",
   "type": "module",
