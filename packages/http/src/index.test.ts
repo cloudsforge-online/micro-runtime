@@ -179,6 +179,35 @@ test('the auth token is fetched per attempt so a short-TTL service token can ref
   assert.equal(s.calls[1]?.headers.get('authorization'), 'Bearer tok-2')
 })
 
+test('a per-request authorization header beats the client\'s own token', async () => {
+  // micro-org#251. `settlement` forwards an OPERATOR's token to custody's admin mint, which needs
+  // `role:admin` — an authority the service token does not carry. The service token winning here
+  // meant that route could only ever be refused.
+  const { c, s } = client([json({ ok: true })], { token: async () => 'service-tok' })
+  await c.post('/v1/admin/treasuries', { }, { headers: { authorization: 'Bearer operator-tok' } })
+  assert.equal(s.calls[0]?.headers.get('authorization'), 'Bearer operator-tok')
+})
+
+test('the caller wins whatever case either side spelled the header in', async () => {
+  const { c, s } = client([json({ ok: true })], {
+    token: async () => 'service-tok',
+    headers: { 'X-Estate': 'cloudsforge' },
+  })
+  await c.get('/wallet', { headers: { Authorization: 'Bearer operator-tok', 'X-Estate': 'override' } })
+  const h = s.calls[0]?.headers
+  assert.equal(h?.get('authorization'), 'Bearer operator-tok')
+  assert.equal(h?.get('x-estate'), 'override')
+})
+
+test('the client token still beats a static client header, which is only a default', async () => {
+  const { c, s } = client([json({ ok: true })], {
+    token: async () => 'service-tok',
+    headers: { authorization: 'Bearer stale-default' },
+  })
+  await c.get('/wallet')
+  assert.equal(s.calls[0]?.headers.get('authorization'), 'Bearer service-tok')
+})
+
 test('a non-JSON body from a peer is an error, not a parse crash', async () => {
   const { c } = client([new Response('<html>502 Bad Gateway</html>', { status: 200 })])
   await assert.rejects(
