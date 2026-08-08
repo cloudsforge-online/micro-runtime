@@ -371,13 +371,26 @@ export class HttpClient {
     }
 
     try {
+      // PRECEDENCE, LOWEST FIRST: the accept default, the client's static `headers`, the client's
+      // token, then the caller's per-request `headers`. The token sits BETWEEN the two bags rather
+      // than after both, and that is the whole point: a static `headers` bag is a default the token
+      // should beat, but a per-request header is an instruction for this one call.
+      //
+      // It used to sit after both, so `if (token) headers['authorization'] = …` silently replaced a
+      // credential the caller had deliberately supplied — while the spread order above claimed the
+      // opposite. `settlement`'s treasury provision route forwards an OPERATOR's bearer token to
+      // custody's admin mint, custody requires `role:admin`, a service token does not carry it, and
+      // so that route could only ever return 500. It never worked once (micro-org#251).
+      //
+      // `mergeHeaders` lower-cases as it goes. Header names are case-insensitive in HTTP but not in
+      // a `Record<string, string>`: without it a caller's `Authorization` and the client's
+      // `authorization` both survive to `fetch`, and which one wins becomes the `Headers`
+      // constructor's business rather than ours.
       const token = await this.#o.token?.()
-      const headers: Record<string, string> = {
-        accept: 'application/json',
-        ...this.#o.headers,
-        ...options.headers,
-      }
+      const headers: Record<string, string> = { accept: 'application/json' }
+      mergeHeaders(headers, this.#o.headers)
       if (token) headers['authorization'] = `Bearer ${token}`
+      mergeHeaders(headers, options.headers)
       if (options.requestId) headers['x-request-id'] = options.requestId
       if (options.traceparent) headers['traceparent'] = options.traceparent
       if (options.idempotencyKey) headers['idempotency-key'] = options.idempotencyKey
@@ -446,6 +459,15 @@ function classify(err: unknown): ResultEvent['outcome'] {
   if (err instanceof TimeoutError) return 'timeout'
   if (err instanceof HttpError) return err.peerDecided ? 'peer_error' : 'server_error'
   return 'transport_error'
+}
+
+/**
+ * Copies `from` onto `into`, lower-casing every name. A later source overwrites an earlier one
+ * whatever case either wrote the name in — see the precedence note in `#attempt`.
+ */
+function mergeHeaders(into: Record<string, string>, from: Record<string, string> | undefined): void {
+  if (!from) return
+  for (const [name, value] of Object.entries(from)) into[name.toLowerCase()] = value
 }
 
 function joinUrl(base: string, path: string): string {

@@ -45,6 +45,12 @@ Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github
 6. **A container holds a credential, not a token.** A service token expires in ten minutes. What
    a container is given at deploy time must be able to outlive that, or the deployment has a
    cliff in it. See below — this is the rule that was missing, and the estate fell off it.
+7. **A per-request `authorization` header beats the client's own token.** Some calls carry a
+   credential that is not this service's: a user's, or an operator's. `HttpClient`'s precedence
+   is accept default → client `headers` → client `token` → per-request `headers`, so "present
+   this credential instead, for this one call" is expressible. It once was not — the token was
+   applied last and silently replaced the caller's, which meant `settlement`'s treasury provision
+   route had never worked (micro-org#251).
 
 See `docs/ecosystem/02-target-architecture.md` AD-17 and AD-20.
 
