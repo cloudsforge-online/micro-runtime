@@ -499,8 +499,14 @@ export class JobRunner {
 
     // The lease is now this runner's problem rather than the handler's. A handler may still call
     // `ctx.heartbeat()` and nothing breaks if it does; it simply no longer has to remember.
+    //
+    // Rule 8 — background work is a leased job — is what this timer *implements*, and it is the one
+    // timer in the estate that cannot itself be a leased job without infinite regress: something
+    // has to hold the lease open while the job holding it runs. It does no domain work, touches no
+    // table but `jobs.locked_until`, lives exactly as long as one handler, and is unref'd so it
+    // never keeps the process alive.
     const lease = new AbortController()
-    const renew = setInterval(() => void this.#renew(job, lease), this.#o.heartbeatMs)
+    const renew = setInterval(() => void this.#renew(job, lease), this.#o.heartbeatMs) // cfctl-allow setInterval: renews the lease of the job it belongs to; see above
     renew.unref?.()
 
     try {
