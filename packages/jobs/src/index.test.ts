@@ -246,6 +246,88 @@ test('the runner honours its concurrency limit', { skip }, async () => {
   assert.ok(peak <= 2, `concurrency exceeded: ${peak}`)
 })
 
+/** Poll a condition rather than sleeping a guessed interval, so the test is quick when it passes. */
+async function waitFor(what: string, condition: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!condition()) {
+    if (Date.now() > deadline) assert.fail(`timed out after ${timeoutMs}ms waiting for ${what}`)
+    await new Promise((r) => setTimeout(r, 10))
+  }
+}
+
+/**
+ * The mainnet incident of 2026-08-08, in miniature. `indexer.backfill ltc:mainnet` ran for over
+ * twelve minutes catching a recovered node up, and because the poll awaited its handlers, nothing
+ * else was claimed for the duration — including `outbox.relay`, so a confirmed deposit was never
+ * delivered to wallet. micro-org#261.
+ */
+test('a slow handler does not stop other kinds being claimed — micro-org#261', { skip }, async () => {
+  const q = queue('runner-1')
+  const relayed: string[] = []
+  const completed: string[] = []
+  let backfillRunning = false
+  let releaseBackfill: () => void = () => {}
+  const runner = new JobRunner({
+    queue: q,
+    pollMs: 5,
+    concurrency: 4,
+    onEvent: (e) => void (e.type === 'completed' && completed.push(e.kind!)),
+  })
+  runner.register('chain.backfill', async () => {
+    backfillRunning = true
+    await new Promise<void>((r) => (releaseBackfill = r))
+  })
+  runner.register('outbox.relay', async (job) => void relayed.push(job.key))
+
+  await q.enqueue({ kind: 'chain.backfill', key: 'ltc:mainnet' })
+  runner.start()
+  try {
+    await waitFor('the backfill to be in flight', () => backfillRunning)
+    // Enqueued only once the slow job holds a slot, so there is no chance of it being claimed in
+    // the same batch — the relay has to be claimed by a *later* poll to be seen at all.
+    await q.enqueue({ kind: 'outbox.relay', key: 'stream' })
+    await waitFor('the relay to finish under a stuck backfill', () =>
+      completed.includes('outbox.relay'),
+    )
+    assert.deepEqual(relayed, ['stream'])
+    // The whole property, stated once: a job ran start to finish while another was still going.
+    assert.ok(!completed.includes('chain.backfill'), 'the backfill was never waited on')
+  } finally {
+    releaseBackfill()
+    await runner.stop(5_000)
+  }
+})
+
+test('an in-flight job keeps its lease without the handler asking — micro-org#261', { skip }, async () => {
+  // A lease deliberately shorter than the handler's run: a backfill's length is set by how far
+  // behind the chain is, so this is the ordinary case and not the pathological one.
+  const q = queue('runner-1', 900)
+  let claims = 0
+  let release: () => void = () => {}
+  const runner = new JobRunner({ queue: q, pollMs: 5, heartbeatMs: 100 })
+  runner.register('slow', async () => {
+    claims += 1
+    await new Promise<void>((r) => (release = r))
+  })
+  await q.enqueue({ kind: 'slow', key: 'k' })
+  runner.start()
+  try {
+    await waitFor('the job to be claimed', () => claims === 1)
+    await new Promise((r) => setTimeout(r, 2_000)) // twice the lease
+    const rows = (await sql`select locked_until from jobs where kind = 'slow' and key = 'k'`) as
+      unknown as Array<{ locked_until: Date }>
+    assert.ok(rows[0], 'the job is still there')
+    assert.ok(
+      rows[0]!.locked_until.getTime() > Date.now(),
+      'the lease was renewed under the running handler',
+    )
+    assert.equal(claims, 1, 'and the runner never re-claimed the job it was already running')
+  } finally {
+    release()
+    await runner.stop(5_000)
+  }
+})
+
 test('stats separate pending, running and dead', { skip }, async () => {
   const q = queue('worker-a')
   await q.enqueue({ kind: 'a', key: '1' })
