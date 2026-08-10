@@ -109,6 +109,69 @@ export class CircuitOpenError extends Error {
   }
 }
 
+/**
+ * Errors raised by the `token` supplier, before a request was ever sent.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **A FAULT IN THE THING THAT AUTHENTICATES US IS NOT EVIDENCE ABOUT THE PEER**, and until this
+ * existed the two were one error and one circuit.
+ *
+ * `#attempt` resolves `token()` inside the same try that wraps `fetch`, so a rejection from it
+ * arrived at `request`'s catch indistinguishable from a socket hang-up: `classify` returned
+ * `transport_error`, and `transport_error` calls `#circuit.failed()`. Five of those in a row open
+ * the breaker — against a peer that has not been dialled once.
+ *
+ * Measured on the CloudsForge testnet estate, 2026-08-10. Every service credential was re-minted at
+ * 12:03:44Z and again at 12:05:59Z; the containers were recreated seconds later still holding the
+ * revoked generation, so `identity` answered every exchange `401 the service credential presented
+ * is not valid`. `ledger`'s chain-backing sweep then recorded, from ONE unchanged cause:
+ *
+ *     12:11:59Z  token rejected  → failure 1
+ *     12:12:00Z  token rejected  → failure 2   run recorded unobserved_reason = 'no_credential'  ✓
+ *     12:12:03Z  token rejected  → failure 3
+ *     12:12:04Z  token rejected  → failure 4   run recorded unobserved_reason = 'no_credential'  ✓
+ *     12:12:07Z  token rejected  → failure 5   → CIRCUIT OPENS
+ *     12:12:08Z  circuit open    → CircuitOpenError
+ *                                  run recorded unobserved_reason = 'unreachable'               ✗
+ *
+ * and every run after that — 12:12:11Z, 12:19:21Z, 12:27:17Z — reported `unreachable` too, because
+ * each 10s half-open probe fails on the token again and re-opens the breaker. `unreachable` is the
+ * ledger's word for "no HTTP answer from the indexer at all", and the operator remedy printed
+ * beside the resulting withdrawal freeze reads *"check it is up and that INDEXER_URL resolves from
+ * this container"*. `indexer` was up and healthy throughout and was never asked anything. The
+ * STEADY STATE of a bad credential was a freeze accusing the wrong service.
+ *
+ * That is the same misattribution `ServiceTokenUnavailableError` was created to end — "a 401 says
+ * 'your credential is bad' when the truth is 'identity is down'" (`@cloudsforge/auth`) —
+ * reinstated one layer down, where it also erases the first five honest rows behind it.
+ *
+ * So a pre-flight failure is marked, and `request` gives it the treatment a fault that never
+ * reached the peer has earned: it does not touch the breaker, it is reported as
+ * `token_unavailable` rather than as a transport error, and it reaches the caller **unchanged** —
+ * which is what lets a caller that knows the supplier's error type keep diagnosing it. Nothing
+ * here inspects, wraps or renames the error, so this file still depends on no auth package.
+ *
+ * **Not retried, either.** `ServiceTokenProvider` puts a one-second floor under its own exchange
+ * attempts, and this client's backoff is 100–200ms, so the two further attempts a default GET
+ * would spend are three identical rejections inside the provider's own backoff window. Failing at
+ * once returns the diagnosis a whole deadline sooner.
+ *
+ * A `WeakSet` rather than a property on the error: the value belongs to the supplier, may be
+ * frozen, and is about to be handed to a caller that must see exactly what was thrown.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+const PREFLIGHT_FAILURES = new WeakSet<object>()
+
+/** Marks `err` as raised before the request left this process, and returns it unchanged. */
+function markPreflight(err: unknown): unknown {
+  if (typeof err === 'object' && err !== null) PREFLIGHT_FAILURES.add(err)
+  return err
+}
+
+function isPreflight(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && PREFLIGHT_FAILURES.has(err)
+}
+
 export interface RequestOptions {
   readonly method?: string
   readonly headers?: Record<string, string>
@@ -154,7 +217,20 @@ export interface ResultEvent {
   readonly status: number | null
   readonly durationMs: number
   readonly attempt: number
-  readonly outcome: 'ok' | 'peer_error' | 'server_error' | 'timeout' | 'transport_error' | 'circuit_open'
+  /**
+   * `token_unavailable` is the one value that describes a call that **did not happen**: `status` is
+   * null and `durationMs` is what the supplier spent, not what a peer did. It is separate from
+   * `transport_error` because a dashboard that counted the two together would show an upstream
+   * failing while it was serving every other caller — see `PREFLIGHT_FAILURES`.
+   */
+  readonly outcome:
+    | 'ok'
+    | 'peer_error'
+    | 'server_error'
+    | 'timeout'
+    | 'transport_error'
+    | 'circuit_open'
+    | 'token_unavailable'
 }
 
 export interface CircuitOptions {
@@ -293,6 +369,22 @@ export class HttpClient {
         return result.value
       } catch (err) {
         lastError = err
+        // Nothing was sent, so there is nothing here that is evidence about the upstream: the
+        // breaker is not touched, no retry is spent, and the error reaches the caller exactly as
+        // the supplier threw it. See `PREFLIGHT_FAILURES` for the estate incident this is written
+        // from.
+        if (isPreflight(err)) {
+          this.#emit({
+            upstream: this.#o.name,
+            method,
+            path,
+            status: null,
+            durationMs: this.#now() - attemptStarted,
+            attempt,
+            outcome: 'token_unavailable',
+          })
+          throw err
+        }
         const outcome = classify(err)
         this.#emit({
           upstream: this.#o.name,
@@ -335,6 +427,20 @@ export class HttpClient {
     options: RequestOptions,
     remainingMs: number,
   ): Promise<{ value: T; status: number }> {
+    // **RESOLVED BEFORE THE DEADLINE PLUMBING, AND IN ITS OWN CATCH.** It used to sit beside the
+    // header merge below, inside the try that wraps `fetch`, which is what made a credential fault
+    // and a socket fault the same error to everything above — see `PREFLIGHT_FAILURES`. Hoisting it
+    // costs nothing: the supplier never receives `signal` and never did, so no deadline was ever
+    // enforced on it here, and `ServiceTokenProvider` bounds its own exchange. What it buys is that
+    // a rejection cannot be reinterpreted by the `timeoutSignal.aborted` branch below and lose its
+    // mark on the way out.
+    let token: string | undefined
+    try {
+      token = await this.#o.token?.()
+    } catch (err) {
+      throw markPreflight(err)
+    }
+
     // `AbortSignal.any` rather than a manual listener, because a caller signal that is *already*
     // aborted when the attempt begins must still abort the request. Registering a listener on an
     // aborted signal never fires, which left the request hanging until its own deadline — the
@@ -386,7 +492,6 @@ export class HttpClient {
       // a `Record<string, string>`: without it a caller's `Authorization` and the client's
       // `authorization` both survive to `fetch`, and which one wins becomes the `Headers`
       // constructor's business rather than ours.
-      const token = await this.#o.token?.()
       const headers: Record<string, string> = { accept: 'application/json' }
       mergeHeaders(headers, this.#o.headers)
       if (token) headers['authorization'] = `Bearer ${token}`
