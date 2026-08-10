@@ -130,6 +130,76 @@ test('a 4xx does not open the circuit — bad input is not an unwell peer', asyn
   assert.equal(c.circuitState, 'closed')
 })
 
+/**
+ * ── A CREDENTIAL FAULT IS NOT EVIDENCE ABOUT THE PEER ─────────────────────────────────────────
+ *
+ * These four drive the CloudsForge testnet incident of 2026-08-10 in miniature. Every service
+ * credential in that estate was re-minted while the containers kept the revoked generation, so
+ * `identity` refused every exchange and `ledger`'s token supplier rejected on every sweep. The
+ * first two sweeps recorded the true cause; from the fifth rejection the breaker opened and every
+ * sweep after that — for as long as the credential stayed wrong — reported the INDEXER as
+ * unreachable, on a service that was healthy and had not been dialled once.
+ */
+test('a token supplier rejection never opens the circuit — nothing was sent to the peer', async () => {
+  const { c, s } = client([json({ ok: true })], {
+    token: () => Promise.reject(new Error('identity refused the credential exchange: 401')),
+    circuit: { threshold: 3, resetMs: 60_000 },
+  })
+  for (let i = 0; i < 10; i++) {
+    await assert.rejects(() => c.get('/x', { retries: 0 }))
+  }
+  assert.equal(c.circuitState, 'closed', 'the breaker guards the peer, and the peer never answered')
+  assert.equal(s.count, 0, 'and no request was ever attempted')
+})
+
+test('the supplier’s error reaches the caller unchanged, so its type still diagnoses it', async () => {
+  class ServiceTokenUnavailableError extends Error {}
+  const thrown = new ServiceTokenUnavailableError('no credential is configured')
+  const { c } = client([json({ ok: true })], { token: () => Promise.reject(thrown) })
+  await assert.rejects(
+    () => c.get('/x', { retries: 0 }),
+    (err: unknown) => {
+      assert.equal(err, thrown, 'not wrapped, not renamed, not replaced')
+      assert.ok(err instanceof ServiceTokenUnavailableError)
+      return true
+    },
+  )
+})
+
+test('a token failure reports token_unavailable, never transport_error', async () => {
+  const events: string[] = []
+  const { c } = client([json({ ok: true })], {
+    token: () => Promise.reject(new Error('identity is unreachable')),
+    onResult: (e: { outcome: string }) => void events.push(e.outcome),
+  })
+  await assert.rejects(() => c.get('/x', { retries: 0 }))
+  assert.deepEqual(events, ['token_unavailable'], 'a dashboard must not read this as the peer failing')
+})
+
+test('a token failure is not retried — the provider’s own backoff outlives this client’s', async () => {
+  let asked = 0
+  const { c, s } = client([json({ ok: true })], {
+    token: () => {
+      asked += 1
+      return Promise.reject(new Error('identity refused the credential exchange: 401'))
+    },
+  })
+  await assert.rejects(() => c.get('/x', { retries: 2 }))
+  assert.equal(asked, 1, 'three identical rejections inside one backoff window buy nothing')
+  assert.equal(s.count, 0)
+})
+
+test('a real transport failure still opens the circuit', async () => {
+  const { c } = client([new TypeError('fetch failed')], {
+    token: () => 'a-live-token',
+    circuit: { threshold: 2, resetMs: 60_000 },
+  })
+  for (let i = 0; i < 2; i++) {
+    await assert.rejects(() => c.get('/x', { retries: 0 }))
+  }
+  assert.equal(c.circuitState, 'open', 'the guard this change must not remove')
+})
+
 test('the circuit half-opens after the reset window', async () => {
   let clock = 0
   const { c } = client([json({}, 500)], {
