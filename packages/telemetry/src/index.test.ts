@@ -192,10 +192,76 @@ test('registering the same metric twice is refused', () => {
   assert.throws(() => m.register({ name: 'x', help: 'x', kind: 'counter' }), /already registered/)
 })
 
-test('an unregistered metric is ignored rather than throwing', () => {
-  const m = new Metrics()
+/**
+ * ── A DISCARDED MEASUREMENT IS NOT AN ABSENCE ─────────────────────────────────────────────────
+ *
+ * Both discards below are correct — a registry must not invent series, and a Prometheus metric may
+ * not vary its label set between samples — and both used to happen in silence, which at the
+ * `/metrics` endpoint is indistinguishable from a thing that never happened.
+ *
+ * What it cost, measured 2026-08-11: `ledger` increments `ledger_indexer_calls_total`
+ * `{ outcome }` on every indexer call and registers that name nowhere. It is the estate's only
+ * counter carrying an outbound call's outcome — the label whose `token_unavailable` value exists
+ * so a dead service credential can be told apart from an unreachable peer (micro-org#351) — and
+ * every write of it has been dropped on this method's first line since it was written.
+ */
+test('an unregistered metric reports why it was dropped, and still does not throw', () => {
+  const dropped: unknown[] = []
+  const m = new Metrics({ onDropped: (d) => void dropped.push(d) })
   m.increment('never_registered')
-  assert.equal(m.render().trim(), '')
+  assert.equal(m.render().trim(), '', 'a registry must still not invent a series')
+  // KILLS: restoring the bare `if (!series) return` in `increment` — the write vanishes again.
+  assert.deepEqual(dropped, [{ metric: 'never_registered', reason: 'unregistered_metric' }])
+})
+
+test('a label the spec does not declare is reported by NAME, and never by value', () => {
+  const dropped: Array<Record<string, unknown>> = []
+  const m = new Metrics({ onDropped: (d) => void dropped.push(d as never) })
+  m.register({ name: 'calls_total', help: 'calls', kind: 'counter', labels: [] })
+  m.increment('calls_total', { outcome: 'token_unavailable' })
+
+  // KILLS: removing the undeclared-label loop from `#labelKey`, which is the exact shape of the
+  // ledger defect above — the counter exists, the reason code is passed, and the series is one
+  // undifferentiated number an operator cannot alert on.
+  assert.deepEqual(dropped, [{ metric: 'calls_total', reason: 'undeclared_label', label: 'outcome' }])
+  assert.doesNotMatch(
+    JSON.stringify(dropped),
+    /token_unavailable/,
+    'a label VALUE can carry anything a caller put in it and must not be echoed',
+  )
+  assert.match(m.render(), /calls_total 1/, 'and the count itself is still recorded')
+})
+
+test('increment on a histogram is reported as the wrong kind, not as a missing metric', () => {
+  const dropped: Array<Record<string, unknown>> = []
+  const m = new Metrics({ onDropped: (d) => void dropped.push(d as never) })
+  m.register({ name: 'lat', help: 'latency', kind: 'histogram' })
+  m.increment('lat')
+  // KILLS: collapsing `#dropped` into a single `unregistered_metric` reason. The remedies differ —
+  // one wants a `register(...)`, the other wants the other method — and a shared reason code is
+  // the defect micro-org#351 is about.
+  assert.deepEqual(dropped, [{ metric: 'lat', reason: 'wrong_kind', registeredKind: 'histogram' }])
+})
+
+test('a dropped write is reported once per distinct problem, not once per write', () => {
+  const dropped: Array<Record<string, unknown>> = []
+  const m = new Metrics({ onDropped: (d) => void dropped.push(d as never) })
+  for (let i = 0; i < 1_000; i++) m.increment('never_registered')
+  m.increment('also_never_registered')
+  // KILLS: removing the `#reported` set. These are raised from per-request seams, and a report
+  // that floods gets deleted again — which is how the silence came back the first time.
+  assert.equal(dropped.length, 2)
+})
+
+test('a reporting sink that throws cannot take the process down', () => {
+  const m = new Metrics({
+    onDropped: () => {
+      throw new Error('the log shipper is down')
+    },
+  })
+  // KILLS: removing the try/catch in `#report`. Rule 3 of this file — observability failing must
+  // never become an outage — and a metric write is on every hot path in the estate.
+  assert.doesNotThrow(() => m.increment('never_registered'))
 })
 
 test('request ids are short, sortable-safe and unambiguous to read aloud', () => {

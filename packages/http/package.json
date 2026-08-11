@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/http",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Outbound HTTP with deadlines, retry, circuit breaking and trace propagation. Zero dependencies.",
   "license": "MIT",
   "type": "module",

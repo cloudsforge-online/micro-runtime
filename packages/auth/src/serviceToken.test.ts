@@ -371,6 +371,49 @@ test('a 401 re-mints once and replays, so a clock disagreement is not a failed r
   assert.equal(world.exchanges, 2)
 })
 
+/**
+ * ── THE RE-MINT INSIDE `fetch`, AND WHY IT HAS TO SAY SO ──────────────────────────────────────
+ *
+ * `authorizedFetch` is handed to `HttpClient` as its `fetch`, so the `await this.token()` on the
+ * 401 path runs INSIDE that client's own try/catch around the wire. Without a mark, a rejection
+ * from it is shaped exactly like a socket hang-up: classified `transport_error`, counted against
+ * the circuit breaker, and after five reported to operators as the peer being unreachable — on a
+ * peer that answered the 401 it is being blamed for. micro-org#351 measured that misattribution at
+ * the `token` seam on 2026-08-10 and recorded this seam as the half still open.
+ *
+ * The assertion is on the registry symbol rather than on the class, because the symbol IS the
+ * contract: `@cloudsforge/http` cannot import this package and reads nothing else.
+ *
+ * KILLS: deleting `readonly [HTTP_PREFLIGHT] = true` from `ServiceTokenUnavailableError`, and
+ * changing the string passed to `Symbol.for` on either side of the seam.
+ */
+test('a re-mint that fails inside authorizedFetch is marked pre-flight, not a peer fault', async (t) => {
+  const world = await estate()
+  t.after(releaseClock)
+  clockAt(0)
+
+  const provider = providerFor(world)
+  const stale = await provider.token()
+
+  // The peer's clock has retired the token ours still trusts — the ordinary reason this path runs
+  // at all — and identity has gone down in between, so the re-mint is what fails.
+  clockAt((SERVICE_TTL_SECONDS + 60) * 1000)
+  world.identityDown = true
+  world.peerCalls.length = 0
+
+  const err = await callPeer(async () => stale, provider.authorizedFetch).then(
+    () => null,
+    (e: unknown) => e,
+  )
+  assert.ok(err instanceof ServiceTokenUnavailableError, `expected the unavailable error, got ${String(err)}`)
+  assert.equal(
+    (err as unknown as Record<symbol, unknown>)[Symbol.for('cloudsforge.http.preflight')],
+    true,
+    'an outbound client must be able to tell this from a socket hang-up without importing this package',
+  )
+  assert.equal(world.peerCalls.length, 1, 'the peer answered once, and is not what failed')
+})
+
 test('a peer that refuses everything is not re-minted at for ever', async (t) => {
   const world = await estate()
   t.after(releaseClock)

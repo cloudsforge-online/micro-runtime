@@ -98,14 +98,52 @@ export class TimeoutError extends Error {
   }
 }
 
+/**
+ * The breaker is open, so this call was refused here rather than attempted.
+ *
+ * **IT CARRIES WHAT OPENED IT.** Until it did, this error was an absence: `circuit open for
+ * indexer, retry in 8412ms` and nothing else. Every caller that has to say WHY a peer was not
+ * observed therefore had exactly one thing it could say — `ledger`'s `reasonFor` maps a bare
+ * `CircuitOpenError` to `unreachable`, and it is right to, because "the breaker is open" is all it
+ * was ever handed. On the testnet estate on 2026-08-10 that turned a dead service credential into
+ * hours of an operator being told the indexer was down; see `PREFLIGHT_FAILURES` below for the
+ * measured timeline and for the pre-flight seam that now keeps a credential fault away from the
+ * breaker entirely.
+ *
+ * With the pre-flight seam in place, `openedBy` should never be `token_unavailable`: a fault that
+ * never reached the wire does not count against the peer. That is precisely why it is worth
+ * reporting rather than assuming — **a failure that should be impossible needs a name an operator
+ * can select on**, or its first occurrence is indistinguishable from the ordinary case it is
+ * hiding inside. `openedBy: 'transport_error'` is a peer that really is unreachable and the
+ * remedy "check it is up" is the right one; anything else means the remedy is somewhere else.
+ *
+ * `cause` is the standard ES2022 option, so `messageOf`/logger redaction and `--stack-trace-limit`
+ * treat it the way they treat every other chained error, and a caller that wants to re-diagnose can
+ * do `err.cause instanceof ServiceTokenUnavailableError` without this package knowing that type.
+ *
+ * The third parameter is optional so that constructing one positionally — which the estate's
+ * tests do — keeps working unchanged.
+ */
 export class CircuitOpenError extends Error {
   readonly upstream: string
   readonly retryAfterMs: number
-  constructor(upstream: string, retryAfterMs: number) {
-    super(`circuit open for ${upstream}, retry in ${retryAfterMs}ms`)
+  /** The outcome of the failure that opened the breaker, or `null` if it was opened without one. */
+  readonly openedBy: ResultEvent['outcome'] | null
+  constructor(
+    upstream: string,
+    retryAfterMs: number,
+    opened?: { readonly by: ResultEvent['outcome']; readonly cause?: unknown },
+  ) {
+    const after = opened ? ` after ${opened.by}` : ''
+    const because =
+      opened?.cause instanceof Error && opened.cause.message ? ` — last failure: ${opened.cause.message}` : ''
+    super(`circuit open for ${upstream}${after}, retry in ${retryAfterMs}ms${because}`, {
+      ...(opened && 'cause' in opened ? { cause: opened.cause } : {}),
+    })
     this.name = 'CircuitOpenError'
     this.upstream = upstream
     this.retryAfterMs = retryAfterMs
+    this.openedBy = opened?.by ?? null
   }
 }
 
@@ -158,9 +196,39 @@ export class CircuitOpenError extends Error {
  *
  * A `WeakSet` rather than a property on the error: the value belongs to the supplier, may be
  * frozen, and is about to be handed to a caller that must see exactly what was thrown.
+ *
+ * ── THE OTHER SEAM, WHICH THIS SET CANNOT REACH ───────────────────────────────────────────────
+ *
+ * The `token` supplier is not the only place a credential fault is raised. `ServiceTokenProvider`
+ * is wired in twice — as `token` AND as `fetch`, because `authorizedFetch` re-mints and replays
+ * once on a 401 — and that re-mint happens **inside the call this file makes to `fetch`**. A
+ * rejection from it therefore arrives at the same catch a socket hang-up arrives at, with the same
+ * consequence the hoist above removed for the supplier: `transport_error`, `#circuit.failed()`,
+ * five of them and the breaker is open against a peer that answered every one of the five.
+ *
+ * micro-org#351 recorded it as a follow-up wanting "a dependency `@cloudsforge/http` does not
+ * currently take". It does not have to take one. `PREFLIGHT` below is a **registry symbol**
+ * (`Symbol.for`), so the two packages agree on one key through the runtime's own global symbol
+ * table without either importing the other, and the direction of dependency between them stays
+ * exactly as it is — none. `@cloudsforge/auth` sets it on `ServiceTokenUnavailableError`, which is
+ * by construction the error meaning "we could not authenticate", never "the peer failed".
+ *
+ * A string key would have done the same job and is what makes this cheap to get wrong: `err.name
+ * === 'ServiceTokenUnavailableError'` couples this file to a class name in a package it is
+ * deliberately independent of, and matches any unrelated error that happens to be spelled the
+ * same. A registered symbol is a name that cannot be collided with by accident.
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 const PREFLIGHT_FAILURES = new WeakSet<object>()
+
+/**
+ * The cross-package mark. An error carrying `[PREFLIGHT] === true` is one whose owner declares it
+ * was raised before anything left this process, so it is not evidence about the peer.
+ *
+ * Set it on an error your own `fetch` or `token` implementation raises; nothing else reads it and
+ * nothing here writes it onto an error it did not create.
+ */
+export const PREFLIGHT: unique symbol = Symbol.for('cloudsforge.http.preflight')
 
 /** Marks `err` as raised before the request left this process, and returns it unchanged. */
 function markPreflight(err: unknown): unknown {
@@ -169,7 +237,9 @@ function markPreflight(err: unknown): unknown {
 }
 
 function isPreflight(err: unknown): boolean {
-  return typeof err === 'object' && err !== null && PREFLIGHT_FAILURES.has(err)
+  if (typeof err !== 'object' || err === null) return false
+  if (PREFLIGHT_FAILURES.has(err)) return true
+  return (err as Record<symbol, unknown>)[PREFLIGHT] === true
 }
 
 export interface RequestOptions {
@@ -253,6 +323,12 @@ class Circuit {
   #failures = 0
   #openedAt = 0
   #state: CircuitState = 'closed'
+  /**
+   * What opened it, kept so `CircuitOpenError` can say so. Refreshed on every failure that opens
+   * or re-opens: after the reset window a half-open probe fails and re-opens, and the fault an
+   * operator needs is the most recent one, not the one from twenty minutes ago.
+   */
+  #opened: { by: ResultEvent['outcome']; cause: unknown } | null = null
   readonly #threshold: number
   readonly #resetMs: number
   readonly #now: () => number
@@ -274,20 +350,30 @@ class Circuit {
     return Math.max(0, this.#resetMs - (this.#now() - this.#openedAt))
   }
 
+  /** The failure that opened it, for `CircuitOpenError`. `null` while the breaker is closed. */
+  get opened(): { readonly by: ResultEvent['outcome']; readonly cause: unknown } | null {
+    return this.#opened
+  }
+
   succeeded(): void {
     this.#failures = 0
     this.#state = 'closed'
+    this.#opened = null
   }
 
   /**
    * Only faults that mean "the peer is unwell" trip the breaker. A 404 or a 400 is the peer
    * answering correctly, and counting those would open the circuit on a caller's own bad input.
+   *
+   * Takes the fault rather than counting anonymously: an open breaker that cannot name what opened
+   * it is the defect micro-org#351 is about, one layer down from where it was first found.
    */
-  failed(): void {
+  failed(by: ResultEvent['outcome'], cause: unknown): void {
     this.#failures += 1
     if (this.#failures >= this.#threshold) {
       this.#state = 'open'
       this.#openedAt = this.#now()
+      this.#opened = { by, cause }
     }
   }
 }
@@ -345,7 +431,12 @@ export class HttpClient {
         attempt: 0,
         outcome: 'circuit_open',
       })
-      throw new CircuitOpenError(this.#o.name, this.#circuit.retryAfterMs)
+      const opened = this.#circuit.opened
+      throw new CircuitOpenError(
+        this.#o.name,
+        this.#circuit.retryAfterMs,
+        opened ? { by: opened.by, cause: opened.cause } : undefined,
+      )
     }
 
     let lastError: unknown
@@ -372,7 +463,9 @@ export class HttpClient {
         // Nothing was sent, so there is nothing here that is evidence about the upstream: the
         // breaker is not touched, no retry is spent, and the error reaches the caller exactly as
         // the supplier threw it. See `PREFLIGHT_FAILURES` for the estate incident this is written
-        // from.
+        // from. This catches BOTH seams a credential fault can be raised at — the `token` supplier
+        // marked by `markPreflight` above, and a re-mint inside a `fetch` implementation, which
+        // marks itself with `PREFLIGHT` because it is a package this one does not depend on.
         if (isPreflight(err)) {
           this.#emit({
             upstream: this.#o.name,
@@ -401,7 +494,7 @@ export class HttpClient {
           this.#circuit.succeeded()
           throw err
         }
-        if (outcome !== 'peer_error') this.#circuit.failed()
+        if (outcome !== 'peer_error') this.#circuit.failed(outcome, err)
 
         // The caller gave up, or the caller's own deadline passed. Neither is our business.
         if (options.signal?.aborted) throw err

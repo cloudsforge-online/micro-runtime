@@ -98,12 +98,44 @@
 export const CREDENTIAL_PREFIX = 'cfsc_'
 
 /**
+ * The key `@cloudsforge/http` reads to decide that a failure happened before anything left this
+ * process — declared with `Symbol.for` so both packages resolve the same symbol out of the
+ * runtime's global registry **without either importing the other**.
+ *
+ * This file deliberately depends on nothing, and `@cloudsforge/http` deliberately depends on no
+ * auth package; a registry symbol is how two independent packages can still agree on one fact.
+ * The string is the contract and is duplicated on purpose — `PREFLIGHT` in `@cloudsforge/http`
+ * carries the other half of this comment, including why a `name` check would have been the wrong
+ * way to spell it.
+ */
+const HTTP_PREFLIGHT: unique symbol = Symbol.for('cloudsforge.http.preflight')
+
+/**
  * We could not obtain a service token. **Answer 503, never 401.**
  *
  * The distinction is the same one `VerifierUnavailableError` draws inbound: a fault in the thing
  * that decides authentication is not evidence that the caller is unauthenticated.
+ *
+ * ── WHY IT MARKS ITSELF PRE-FLIGHT ────────────────────────────────────────────────────────────
+ *
+ * Every instance of this error means one thing — *we could not authenticate* — and it is raised
+ * only on this side of the wire. It is never a peer's answer and never evidence about a peer, so
+ * it says so in a way an outbound client can read without knowing this class exists.
+ *
+ * It matters because of where the error surfaces. A provider is wired into `HttpClient` twice:
+ * as `token`, which that client already resolves outside its fetch seam, and as `fetch`, because
+ * `authorizedFetch` re-mints and replays once on a 401. The re-mint on that second path happens
+ * INSIDE the client's `fetch` call, so without this mark its rejection reaches the client's catch
+ * shaped exactly like a socket hang-up: classified `transport_error`, counted against the
+ * circuit breaker, and — five of them later — reported to operators as the peer being unreachable
+ * while the peer is answering every request it is given. That is the misattribution micro-org#351
+ * measured on the testnet estate on 2026-08-10, recorded as still open one layer down, and this
+ * is the half of the fix that lives on this side of the seam.
  */
 export class ServiceTokenUnavailableError extends Error {
+  /** See `HTTP_PREFLIGHT`. Read by `@cloudsforge/http` through the global symbol registry. */
+  readonly [HTTP_PREFLIGHT] = true
+
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options)
     this.name = 'ServiceTokenUnavailableError'
@@ -300,6 +332,13 @@ export class ServiceTokenProvider {
     // Discard exactly the token that was rejected. Keyed on the token itself, so ten concurrent
     // 401s cause ONE re-mint: the first swaps `#held`, and the other nine find their presented
     // token is no longer the held one and simply replay with the new one.
+    //
+    // **THIS `await` CAN REJECT, AND IT REJECTS INSIDE SOMEBODY ELSE'S `fetch`.** It throws
+    // `ServiceTokenUnavailableError`, which marks itself pre-flight for exactly this line — see
+    // that class. Deliberately not caught and converted here: the caller asked for a request it
+    // cannot authenticate, and returning the peer's 401 instead would tell it "your credential is
+    // bad" when the truth is "we have no credential", which is the inversion this whole file
+    // exists to prevent.
     this.#discard(presented)
     const fresh = await this.token()
     if (fresh === presented) return response
