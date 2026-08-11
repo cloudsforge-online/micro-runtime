@@ -219,6 +219,54 @@ export interface MetricSpec {
 const DEFAULT_BUCKETS = [5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000]
 
 /**
+ * Why a write was thrown away.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **A DISCARDED MEASUREMENT USED TO BE AN ABSENCE.** `increment`, `set` and `observe` each began
+ * with a guard that returned on an unknown name, and `labelKey` filtered out every label the spec
+ * had not declared. Both are the right behaviour — a registry must not invent series, and a
+ * Prometheus metric may not vary its label set between samples — but both were performed in
+ * silence, and a silent discard is indistinguishable at the `/metrics` endpoint from a thing that
+ * simply never happened.
+ *
+ * What that cost, measured 2026-08-11: `ledger` writes
+ * `metrics.increment('ledger_indexer_calls_total', { outcome: event.outcome })` on every indexer
+ * call, and `ledger_indexer_calls_total` is registered nowhere. It is the estate's ONLY counter
+ * carrying the outcome of an outbound call — the label whose `token_unavailable` value exists
+ * precisely so a dead service credential can be told apart from an unreachable peer (micro-org#351)
+ * — and every increment of it has been dropped on the first line of this method since it was
+ * written. The reason code was added, and remained unalertable, because nothing said so.
+ *
+ * The two mistakes are separated rather than merged, because the remedies are different: an
+ * unregistered name wants a `register(...)` beside the other specs, and an undeclared label wants
+ * that spec's `labels` widened. Reporting them as one "bad metric write" would put an operator
+ * back where a shared reason code always puts them.
+ *
+ * **Reported, never thrown.** Rule 3 of this file: a log line is never allowed to throw, and a
+ * metric is the same bargain — observability failing must not become an outage.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export interface DroppedMetricWrite {
+  readonly metric: string
+  readonly reason: 'unregistered_metric' | 'wrong_kind' | 'undeclared_label'
+  /** The label NAME for `undeclared_label`. Never the value — a label value can carry anything. */
+  readonly label?: string
+  /** What the spec says it is, when that is the disagreement. */
+  readonly registeredKind?: MetricKind
+}
+
+export interface MetricsOptions {
+  /**
+   * Where a dropped write is reported. Default: one line on stderr per DISTINCT problem.
+   *
+   * Deduplicated because these are raised from the hot path — an unregistered counter on a
+   * per-request seam would otherwise turn one missing `register` call into a log flood, which is
+   * its own outage and would get the reporting removed again.
+   */
+  readonly onDropped?: (dropped: DroppedMetricWrite) => void
+}
+
+/**
  * A small Prometheus-format registry.
  *
  * Beacon already exposes Prometheus text explicitly so that "adopting a scraper costs a scrape
@@ -229,6 +277,12 @@ export class Metrics {
   readonly #specs = new Map<string, MetricSpec>()
   readonly #values = new Map<string, Map<string, number>>()
   readonly #histograms = new Map<string, Map<string, { counts: number[]; sum: number; count: number }>>()
+  readonly #onDropped: (dropped: DroppedMetricWrite) => void
+  readonly #reported = new Set<string>()
+
+  constructor(options: MetricsOptions = {}) {
+    this.#onDropped = options.onDropped ?? reportDroppedToStderr
+  }
 
   register(spec: MetricSpec): this {
     if (this.#specs.has(spec.name)) throw new Error(`metric already registered: ${spec.name}`)
@@ -240,22 +294,22 @@ export class Metrics {
 
   increment(name: string, labels: Record<string, string> = {}, by = 1): void {
     const series = this.#values.get(name)
-    if (!series) return
-    const key = labelKey(this.#specs.get(name), labels)
+    if (!series) return this.#dropped(name)
+    const key = this.#labelKey(this.#specs.get(name), labels)
     series.set(key, (series.get(key) ?? 0) + by)
   }
 
   set(name: string, value: number, labels: Record<string, string> = {}): void {
     const series = this.#values.get(name)
-    if (!series) return
-    series.set(labelKey(this.#specs.get(name), labels), value)
+    if (!series) return this.#dropped(name)
+    series.set(this.#labelKey(this.#specs.get(name), labels), value)
   }
 
   observe(name: string, value: number, labels: Record<string, string> = {}): void {
     const spec = this.#specs.get(name)
     const series = this.#histograms.get(name)
-    if (!spec || !series) return
-    const key = labelKey(spec, labels)
+    if (!spec || !series) return this.#dropped(name)
+    const key = this.#labelKey(spec, labels)
     const buckets = spec.buckets ?? DEFAULT_BUCKETS
     let entry = series.get(key)
     if (!entry) {
@@ -294,14 +348,69 @@ export class Metrics {
     }
     return `${lines.join('\n')}\n`
   }
+
+  /**
+   * A name this registry does not know. Split into "never registered" and "registered as another
+   * kind", because `increment` on a histogram lands in the same `if (!series)` as a typo and the
+   * two are fixed in different places.
+   */
+  #dropped(name: string): void {
+    const spec = this.#specs.get(name)
+    this.#report(
+      spec
+        ? { metric: name, reason: 'wrong_kind', registeredKind: spec.kind }
+        : { metric: name, reason: 'unregistered_metric' },
+    )
+  }
+
+  #labelKey(spec: MetricSpec | undefined, labels: Record<string, string>): string {
+    const allowed = spec?.labels ?? []
+    for (const name of Object.keys(labels)) {
+      if (!allowed.includes(name)) {
+        this.#report({ metric: spec?.name ?? '(unregistered)', reason: 'undeclared_label', label: name })
+      }
+    }
+    return allowed
+      .filter((l) => labels[l] !== undefined)
+      .map((l) => `${l}="${escapeLabel(labels[l]!)}"`)
+      .join(',')
+  }
+
+  /** Once per distinct problem, and never allowed to throw — see `DroppedMetricWrite`. */
+  #report(dropped: DroppedMetricWrite): void {
+    const key = `${dropped.reason} ${dropped.metric} ${dropped.label ?? ''}`
+    if (this.#reported.has(key)) return
+    this.#reported.add(key)
+    try {
+      this.#onDropped(dropped)
+    } catch {
+      /* an observability failure must not become an outage */
+    }
+  }
 }
 
-function labelKey(spec: MetricSpec | undefined, labels: Record<string, string>): string {
-  const allowed = spec?.labels ?? []
-  return allowed
-    .filter((l) => labels[l] !== undefined)
-    .map((l) => `${l}="${escapeLabel(labels[l]!)}"`)
-    .join(',')
+/**
+ * The default sink. Deliberately `process.stderr` rather than a `Logger`: `Metrics` is constructed
+ * before a logger exists in several composition roots, and a dropped write is a deployment defect
+ * an operator should see in `docker logs` whether or not log shipping is working.
+ */
+function reportDroppedToStderr(dropped: DroppedMetricWrite): void {
+  const remedy =
+    dropped.reason === 'unregistered_metric'
+      ? `register it: metrics.register({ name: '${dropped.metric}', ... })`
+      : dropped.reason === 'wrong_kind'
+        ? `it is registered as a ${dropped.registeredKind ?? 'different'}; use the matching method`
+        : `add '${dropped.label}' to that metric's spec labels, or stop passing it`
+  process.stderr.write(
+    `${JSON.stringify({
+      level: 'warn',
+      msg: 'metric write dropped',
+      metric: dropped.metric,
+      reason: dropped.reason,
+      ...(dropped.label ? { label: dropped.label } : {}),
+      remedy,
+    })}\n`,
+  )
 }
 
 function joinLabels(base: string, extra: string): string {

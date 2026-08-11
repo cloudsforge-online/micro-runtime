@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/telemetry",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Structured logging with redaction, trace correlation and a metrics facade. Replaces six byte-identical copies of obs.ts.",
   "license": "MIT",
   "type": "module",

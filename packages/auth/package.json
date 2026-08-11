@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/auth",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "One JWKS verifier and scope check, replacing five divergent per-service copies.",
   "license": "MIT",
   "type": "module",

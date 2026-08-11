@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { CircuitOpenError, HttpClient, HttpError, TimeoutError, redactUrl } from './index.ts'
+import { CircuitOpenError, HttpClient, HttpError, PREFLIGHT, TimeoutError, redactUrl } from './index.ts'
 
 /** A fetch stand-in driven by a scripted list of responses or thrown errors. */
 function scripted(steps: Array<Response | Error | ((req: Request) => Response)>) {
@@ -174,6 +174,86 @@ test('a token failure reports token_unavailable, never transport_error', async (
   })
   await assert.rejects(() => c.get('/x', { retries: 0 }))
   assert.deepEqual(events, ['token_unavailable'], 'a dashboard must not read this as the peer failing')
+})
+
+/**
+ * ── THE OTHER SEAM: A RE-MINT THAT FAILS INSIDE `fetch` ───────────────────────────────────────
+ *
+ * `ServiceTokenProvider` is wired in as `fetch` as well as `token`, because `authorizedFetch`
+ * re-mints and replays once on a 401 — and that re-mint runs inside this client's own call to
+ * `fetch`. micro-org#351 measured the supplier seam and recorded this one as still open. These
+ * two drive it through the registry-symbol mark rather than the `WeakSet`, which is the only way
+ * an error raised in another package can reach `isPreflight`.
+ *
+ * KILLS: dropping the `PREFLIGHT` branch from `isPreflight` — i.e. reverting it to
+ * `PREFLIGHT_FAILURES.has(err)` alone. Both go red: the outcome becomes `transport_error` and the
+ * breaker opens against a peer that answered every request it was given.
+ */
+test('a marked failure raised inside fetch is pre-flight — the breaker is not touched', async () => {
+  const remintFailed = Object.assign(new Error('could not exchange the service credential: 401'), {
+    [PREFLIGHT]: true,
+  })
+  const { c, s } = client([remintFailed], { circuit: { threshold: 3, resetMs: 60_000 } })
+  for (let i = 0; i < 10; i++) {
+    await assert.rejects(() => c.get('/x', { retries: 0 }), (err: unknown) => err === remintFailed)
+  }
+  assert.equal(c.circuitState, 'closed', 'a credential we could not mint is not evidence about the peer')
+  assert.equal(s.count, 10, 'and the peer was reached every single time')
+})
+
+test('a marked failure raised inside fetch reports token_unavailable, never transport_error', async () => {
+  const events: string[] = []
+  const remintFailed = Object.assign(new Error('identity refused the credential exchange'), {
+    [PREFLIGHT]: true,
+  })
+  const { c } = client([remintFailed], {
+    onResult: (e: { outcome: string }) => void events.push(e.outcome),
+  })
+  await assert.rejects(() => c.get('/x', { retries: 0 }))
+  assert.deepEqual(events, ['token_unavailable'])
+})
+
+/**
+ * ── AN OPEN BREAKER THAT CANNOT NAME WHAT OPENED IT IS AN ABSENCE ─────────────────────────────
+ *
+ * `CircuitOpenError` used to carry the upstream and a retry delay and nothing else, so every
+ * caller that had to say WHY a peer went unobserved had exactly one thing it could say. That is
+ * how `unreachable` became the steady state of a dead credential on the testnet estate on
+ * 2026-08-10 (micro-org#351): the breaker was open, and "the breaker is open" was the whole of
+ * what downstream was handed.
+ *
+ * KILLS: `Circuit.failed` ignoring its arguments (`#opened` never set), and `CircuitOpenError`
+ * ignoring its third parameter. Either one turns `openedBy` to null, empties `cause` and shortens
+ * the message back to what it used to say.
+ */
+test('an open circuit says what opened it, and carries that failure as the cause', async () => {
+  const refused = new Error('connect ECONNREFUSED 10.0.0.4:4003')
+  const { c } = client([refused], { circuit: { threshold: 2, resetMs: 60_000 } })
+  for (let i = 0; i < 2; i++) await assert.rejects(() => c.get('/x', { retries: 0 }))
+  assert.equal(c.circuitState, 'open')
+
+  await assert.rejects(
+    () => c.get('/x'),
+    (err: unknown) => {
+      assert.ok(err instanceof CircuitOpenError)
+      assert.equal(err.openedBy, 'transport_error', 'this peer really was unreachable, and says so')
+      assert.equal(err.cause, refused, 'the fault itself, so a caller can re-diagnose it')
+      assert.match(err.message, /after transport_error/)
+      assert.match(err.message, /ECONNREFUSED/, 'the remedy an operator needs is in the message')
+      return true
+    },
+  )
+})
+
+test('a peer that keeps answering 500 opens the breaker as server_error, not as a transport fault', async () => {
+  // The distinction the whole change is for: `server_error` sends an operator to the peer's logs,
+  // `transport_error` sends them to the network, and before this they were one word — none.
+  const { c } = client([json({ e: 1 }, 500)], { circuit: { threshold: 2, resetMs: 60_000 } })
+  for (let i = 0; i < 2; i++) await assert.rejects(() => c.get('/x', { retries: 0 }))
+  await assert.rejects(
+    () => c.get('/x'),
+    (err: unknown) => err instanceof CircuitOpenError && err.openedBy === 'server_error',
+  )
 })
 
 test('a token failure is not retried — the provider’s own backoff outlives this client’s', async () => {
