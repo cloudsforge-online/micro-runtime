@@ -43,8 +43,34 @@ async function fixtures() {
     keySet,
     expectedNetwork: 'mainnet',
   })
-  return { sign, verifier, mainnetVerifier, jwk }
+  return { sign, verifier, mainnetVerifier, jwk, keySet }
 }
+
+test('AUTH_EXPECTED_NETWORK arms the gate without an option, and an explicit option wins', async () => {
+  // The one env read the package permits itself — the constructor documents why: the
+  // shared-identity migration arms ~25 services with one compose anchor instead of 25 edited
+  // constructor sites across a release boundary. Proven here so the fallback can never silently
+  // stop working.
+  const { sign, keySet } = await fixtures()
+  const previous = process.env['AUTH_EXPECTED_NETWORK']
+  process.env['AUTH_EXPECTED_NETWORK'] = 'mainnet'
+  try {
+    const armedByEnv = new Verifier({ jwksUrl: 'http://unused', issuer: ISSUER, keySet })
+    const foreign = await sign({ typ: 'service', sub: 'service:pool', scopes: [], net: 'testnet' })
+    await assert.rejects(armedByEnv.verify(foreign), (err: unknown) => {
+      assert.ok(err instanceof TokenError)
+      assert.equal((err as TokenError & { code: string }).code, 'wrong_network')
+      return true
+    })
+    // An explicit option beats the env: a verifier told testnet accepts the testnet token even
+    // while the env says mainnet.
+    const explicit = new Verifier({ jwksUrl: 'http://unused', issuer: ISSUER, keySet, expectedNetwork: 'testnet' })
+    assert.equal((await explicit.verify(foreign)).sub, 'service:pool')
+  } finally {
+    if (previous === undefined) delete process.env['AUTH_EXPECTED_NETWORK']
+    else process.env['AUTH_EXPECTED_NETWORK'] = previous
+  }
+})
 
 test('a token minted for the other network is refused — 401, not 503 (micro-org#459)', async () => {
   // Both estates verifying against one identity means scope alone no longer separates them: a
