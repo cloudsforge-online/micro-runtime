@@ -37,8 +37,47 @@ async function fixtures() {
       .sign(privateKey)
 
   const verifier = new Verifier({ jwksUrl: 'http://unused', issuer: ISSUER, keySet })
-  return { sign, verifier, jwk }
+  const mainnetVerifier = new Verifier({
+    jwksUrl: 'http://unused',
+    issuer: ISSUER,
+    keySet,
+    expectedNetwork: 'mainnet',
+  })
+  return { sign, verifier, mainnetVerifier, jwk }
 }
+
+test('a token minted for the other network is refused — 401, not 503 (micro-org#459)', async () => {
+  // Both estates verifying against one identity means scope alone no longer separates them: a
+  // testnet service token with ledger:post would pass a mainnet ledger's scope gate. The `net`
+  // claim is the separation, and the refusal must be a TOKEN fault — deterministic on every
+  // retry — not the "try again later" a 503 promises.
+  const { sign, mainnetVerifier } = await fixtures()
+  const token = await sign({ typ: 'service', sub: 'service:pool', scopes: ['ledger:post'], net: 'testnet' })
+  await assert.rejects(mainnetVerifier.verify(token), (err: unknown) => {
+    assert.ok(err instanceof TokenError, `expected TokenError, got ${String(err)}`)
+    assert.equal((err as TokenError & { code: string }).code, 'wrong_network')
+    return true
+  })
+})
+
+test('a token WITHOUT the net claim still verifies under an expecting deployment', async () => {
+  // Deliberate rollout tolerance: enforcement must be deployable before every token in flight
+  // carries the claim, or the upgrade moment takes both estates down. The tolerance is recorded
+  // as a decision at VerifierOptions.expectedNetwork.
+  const { sign, mainnetVerifier } = await fixtures()
+  const token = await sign({ typ: 'service', sub: 'service:pool', scopes: ['ledger:post'] })
+  const payload = await mainnetVerifier.verify(token)
+  assert.equal(payload.sub, 'service:pool')
+})
+
+test('a matching net claim verifies, and a verifier with no expectation ignores the claim', async () => {
+  const { sign, verifier, mainnetVerifier } = await fixtures()
+  const matching = await sign({ typ: 'user', sub: 'u-9', handle: 'sam', roles: [], net: 'mainnet' })
+  assert.equal((await mainnetVerifier.verify(matching)).sub, 'u-9')
+  const foreign = await sign({ typ: 'user', sub: 'u-9', handle: 'sam', roles: [], net: 'testnet' })
+  // No expectedNetwork: the claim is inert, which is every service before the env lands.
+  assert.equal((await verifier.verify(foreign)).sub, 'u-9')
+})
 
 test('a valid user token verifies and yields a user principal', async () => {
   const { sign, verifier } = await fixtures()
