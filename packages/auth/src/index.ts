@@ -107,6 +107,19 @@ export interface VerifierOptions {
   readonly clockToleranceSec?: number
   /** Test seam. Production uses the remote JWKS with jose's own caching. */
   readonly keySet?: ReturnType<typeof createRemoteJWKSet>
+  /**
+   * The network this deployment IS — 'mainnet' or 'testnet' — and the reason it matters
+   * (micro-org#459 stage 2). Both estates verifying against ONE identity means a token minted
+   * for a testnet service would otherwise pass at a mainnet service: receivers gate on SCOPE,
+   * not on network, so a testnet compromise could reach mainnet money writes. When this is set
+   * and a token carries a `net` claim, they must match.
+   *
+   * A token WITHOUT the claim is accepted, deliberately: enforcement has to be deployable
+   * before every token in flight carries the claim, and a hard requirement here would take both
+   * estates down at the moment of upgrade. Once both identities mint the claim everywhere, the
+   * tolerance can be revisited — as a decision, not a default.
+   */
+  readonly expectedNetwork?: string
 }
 
 export class Verifier {
@@ -114,11 +127,13 @@ export class Verifier {
   readonly #issuer: string
   readonly #audience: string
   readonly #clockTolerance: number
+  readonly #expectedNetwork: string | null
 
   constructor(options: VerifierOptions) {
     this.#keys = options.keySet ?? createRemoteJWKSet(new URL(options.jwksUrl))
     this.#issuer = options.issuer
     this.#audience = options.audience ?? AUDIENCE
+    this.#expectedNetwork = options.expectedNetwork ?? null
     this.#clockTolerance = options.clockToleranceSec ?? 5
   }
 
@@ -131,8 +146,23 @@ export class Verifier {
         clockTolerance: this.#clockTolerance,
         algorithms: ['RS256'],
       })
+      // The network gate, AFTER the signature: a claim on an unverified token is attacker text.
+      // See VerifierOptions.expectedNetwork for why absence is tolerated and mismatch is not.
+      if (this.#expectedNetwork !== null) {
+        const net = (payload as { net?: unknown }).net
+        if (typeof net === 'string' && net !== this.#expectedNetwork) {
+          throw new TokenError(
+            `token minted for network ${net}, this deployment is ${this.#expectedNetwork}`,
+            'wrong_network',
+          )
+        }
+      }
       return payload
     } catch (err) {
+      // The network gate above throws from INSIDE this try. Without this line its refusal would
+      // fall through to VerifierUnavailableError below and answer 503 — "try again later" — for a
+      // token that must be refused identically on every retry.
+      if (err instanceof TokenError) throw err
       const code = (err as { code?: string }).code
       if (code && TOKEN_FAULTS.has(code)) {
         throw new TokenError(messageOf(err), code)
