@@ -133,7 +133,22 @@ export class Verifier {
     this.#keys = options.keySet ?? createRemoteJWKSet(new URL(options.jwksUrl))
     this.#issuer = options.issuer
     this.#audience = options.audience ?? AUDIENCE
-    this.#expectedNetwork = options.expectedNetwork ?? null
+    // ── THE ONE ENV READ THIS PACKAGE PERMITS ITSELF, AND WHY ─────────────────────────────────
+    //
+    // This package otherwise takes everything through options, and that discipline stands. The
+    // exception is deliberate and estate-shaped (micro-org#459 stage 2): the network gate has to
+    // arrive at ~25 services at once for the shared-identity migration to be safe, and an option
+    // means 25 constructor sites edited in step across a release boundary — during which a missed
+    // one is a service that silently accepts the other estate's tokens forever. One compose
+    // anchor setting AUTH_EXPECTED_NETWORK arms every verifier in the estate in a single deploy,
+    // and an explicit option still wins where a caller has an opinion.
+    //
+    // Safe to arm before any token carries the claim: absent claims are tolerated (see
+    // expectedNetwork above), so the gate only ever bites on a token that NAMES the wrong estate.
+    this.#expectedNetwork =
+      options.expectedNetwork ??
+      (typeof process !== 'undefined' ? (process.env['AUTH_EXPECTED_NETWORK'] ?? null) : null) ??
+      null
     this.#clockTolerance = options.clockToleranceSec ?? 5
   }
 
