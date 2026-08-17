@@ -378,7 +378,13 @@ export class Metrics {
 
   /** Once per distinct problem, and never allowed to throw — see `DroppedMetricWrite`. */
   #report(dropped: DroppedMetricWrite): void {
-    const key = `${dropped.reason} ${dropped.metric} ${dropped.label ?? ''}`
+    // The separator is `\u0000` ESCAPED rather than typed. A raw NUL byte in a source file makes
+    // the file binary to everything that reads sources as text: git stops diffing it, and the
+    // estate's static sweeps refuse it outright — `ledger-accounts` failed with "could not be
+    // read as UTF-8 source: a NUL byte at offset 15631" and took estate-ci red with it from
+    // c5eed0d (2026-08-11) until this line was written out. The escape compiles to the same
+    // character, which is the point: nothing about the key changes, only how it is spelled.
+    const key = `${dropped.reason}\u0000${dropped.metric}\u0000${dropped.label ?? ''}`
     if (this.#reported.has(key)) return
     this.#reported.add(key)
     try {
