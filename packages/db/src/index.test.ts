@@ -9,6 +9,8 @@ import {
   migrate,
   type Migration,
   type Sql,
+  NetworkNotConfiguredError,
+  networkSql,
 } from './index.ts'
 
 const url = process.env['RUNTIME_TEST_DATABASE_URL']
@@ -216,4 +218,73 @@ test('the advisory lock is released even when a migration fails', { skip }, asyn
     { service: 'lockcheck' },
   )
   assert.equal(result.applied.length, 1)
+})
+
+/* ── ONE SERVICE, TWO NETWORKS, TWO DATABASES ─────────────────────────────────────────────────────
+ *
+ * These need no postgres: `networkSql` is a selector over `Sql` handles, and the property worth
+ * proving is which handle comes back — and, far more importantly, what happens when the answer is
+ * "none". See micro-deploy `docs/network-consolidation.md` §2.2.
+ */
+
+const fakeSql = (tag: string) => ({ tag }) as unknown as Sql
+
+test('hands back the handle for the network asked for, and they are not the same handle', () => {
+  const main = fakeSql('mainnet')
+  const test_ = fakeSql('testnet')
+  const sql = networkSql({ mainnet: main, testnet: test_ })
+  assert.equal(sql.for('mainnet'), main)
+  assert.equal(sql.for('testnet'), test_)
+  assert.notEqual(sql.for('mainnet'), sql.for('testnet'))
+})
+
+test('REFUSES a network it was not configured for, rather than falling back to the other one', () => {
+  /*
+   * The assertion this file exists for. A single-network service that is handed a testnet request
+   * has exactly one correct behaviour: fail. Returning the mainnet handle "because it is the one we
+   * have" writes testnet data into mainnet tables, and does it quietly — the query succeeds, the
+   * rows look ordinary, and nothing surfaces until a reconciliation months later.
+   */
+  const sql = networkSql({ mainnet: fakeSql('mainnet') })
+  assert.throws(() => sql.for('testnet'), NetworkNotConfiguredError)
+})
+
+test('reports which networks it has, so a service can log what it is actually serving', () => {
+  assert.deepEqual(networkSql({ mainnet: fakeSql('m') }).networks, ['mainnet'])
+  assert.deepEqual(networkSql({ mainnet: fakeSql('m'), testnet: fakeSql('t') }).networks, [
+    'mainnet',
+    'testnet',
+  ])
+})
+
+test('refuses to be built with no networks at all', () => {
+  // A selector over nothing is a service that cannot serve any request. Better to fail at boot
+  // than on the first one.
+  assert.throws(() => networkSql({}), NetworkNotConfiguredError)
+})
+
+test('each() walks every configured network — the shape a worker and a migrator both need', async () => {
+  // Workers have no request to read a network from; they do the work once per network. Migrations
+  // are the same shape: a schema change must land on `<db>` AND `<db>_testnet` in one job, or the
+  // two drift and the next deploy fails on whichever was missed.
+  const sql = networkSql({ mainnet: fakeSql('m'), testnet: fakeSql('t') })
+  const seen: string[] = []
+  await sql.each(async (handle, network) => {
+    seen.push(`${network}:${(handle as unknown as { tag: string }).tag}`)
+  })
+  assert.deepEqual(seen, ['mainnet:m', 'testnet:t'])
+})
+
+test('each() names the network in a failure, because "it broke" is unusable with two of them', async () => {
+  const sql = networkSql({ mainnet: fakeSql('m'), testnet: fakeSql('t') })
+  await assert.rejects(
+    sql.each(async (_h, network) => {
+      if (network === 'testnet') throw new Error('relation does not exist')
+    }),
+    (err: unknown) => {
+      assert.match(String((err as Error).message), /testnet/)
+      assert.match(String((err as Error).message), /relation does not exist/)
+      return true
+    },
+  )
 })

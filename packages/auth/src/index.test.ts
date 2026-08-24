@@ -261,3 +261,93 @@ test('bearerFrom parses only a well-formed header', () => {
 test('statusFor returns null for an unrelated error, so it is not swallowed', () => {
   assert.equal(statusFor(new Error('database down')), null)
 })
+
+/* ── THE GATE MOVES FROM THE DEPLOYMENT TO THE REQUEST ────────────────────────────────────────────
+ *
+ * `expectedNetwork` asks "what network is this process?" — a question that stops having an answer
+ * the moment one pod serves both (micro-deploy `docs/network-consolidation.md`). These tests pin
+ * the replacement: `verify(token, { network })` compares the token's `net` against the network the
+ * REQUEST arrived on, and the deployment constant survives only as the fallback for services that
+ * really are single-network.
+ */
+
+test('a per-request network decides the gate, and one verifier serves both', async () => {
+  // The consolidation in one test. ONE verifier — the merged pod has only one — refuses the
+  // testnet token on a mainnet-routed request and accepts it on a testnet-routed one. Under the
+  // old boot-time gate this was two processes.
+  const { sign, keySet } = await fixtures()
+  const merged = new Verifier({ jwksUrl: 'http://unused', issuer: ISSUER, keySet })
+  const testnetToken = await sign({ typ: 'service', sub: 'service:pool', scopes: ['ledger:post'], net: 'testnet' })
+
+  await assert.rejects(merged.verify(testnetToken, { network: 'mainnet' }), (err: unknown) => {
+    assert.ok(err instanceof TokenError)
+    assert.equal((err as TokenError & { code: string }).code, 'wrong_network')
+    return true
+  })
+  assert.equal((await merged.verify(testnetToken, { network: 'testnet' })).sub, 'service:pool')
+})
+
+test('the request network beats the deployment constant, which is only a fallback now', async () => {
+  // A merged pod may still carry AUTH_EXPECTED_NETWORK from before the merge. The request must
+  // win, or the merge silently refuses every testnet request at a pod whose old env says mainnet.
+  const { sign, keySet } = await fixtures()
+  const stillSaysMainnet = new Verifier({
+    jwksUrl: 'http://unused',
+    issuer: ISSUER,
+    keySet,
+    expectedNetwork: 'mainnet',
+  })
+  const testnetToken = await sign({ typ: 'user', sub: 'u-9', handle: 'sam', roles: [], net: 'testnet' })
+  assert.equal((await stillSaysMainnet.verify(testnetToken, { network: 'testnet' })).sub, 'u-9')
+})
+
+test('with no per-request network the deployment constant still gates, unchanged', async () => {
+  // Every caller that has not been taught the header yet — which is all of them on the day this
+  // ships — keeps exactly today's behaviour. That is what makes this deployable on its own.
+  const { sign, mainnetVerifier } = await fixtures()
+  const foreign = await sign({ typ: 'service', sub: 'service:pool', scopes: [], net: 'testnet' })
+  await assert.rejects(mainnetVerifier.verify(foreign), (err: unknown) => {
+    assert.equal((err as TokenError & { code: string }).code, 'wrong_network')
+    return true
+  })
+})
+
+test('a net-less token is tolerated on a request-gated verify, and COUNTED', async () => {
+  /*
+   * The tolerance has to survive the move — tokens minted before the claim existed are still in
+   * flight, and refusing them takes the estate down at the upgrade moment. But a tolerance nobody
+   * measures is a tolerance nobody can ever close, so the verifier reports each one. The plan
+   * closes the window on that number reaching zero, not on a date.
+   */
+  const { sign, keySet } = await fixtures()
+  const seen: Array<{ network: string }> = []
+  const merged = new Verifier({
+    jwksUrl: 'http://unused',
+    issuer: ISSUER,
+    keySet,
+    onNetlessToken: (e) => seen.push(e),
+  })
+  const netless = await sign({ typ: 'service', sub: 'service:pool', scopes: ['ledger:post'] })
+  assert.equal((await merged.verify(netless, { network: 'testnet' })).sub, 'service:pool')
+  assert.deepEqual(seen, [{ network: 'testnet' }])
+
+  // A token that DOES carry the claim is not counted — the number has to mean "tokens that predate
+  // the claim", not "tokens verified".
+  const claimed = await sign({ typ: 'service', sub: 'service:pool', scopes: [], net: 'testnet' })
+  await merged.verify(claimed, { network: 'testnet' })
+  assert.equal(seen.length, 1)
+})
+
+test('principal() forwards the request network, so the gate is not bypassed by the common path', async () => {
+  // `principal()` is what most routes call. If it could not carry the network, every route using
+  // it would verify a foreign token successfully — the gate would exist and never run.
+  const { sign, keySet } = await fixtures()
+  const merged = new Verifier({ jwksUrl: 'http://unused', issuer: ISSUER, keySet })
+  const testnetToken = await sign({ typ: 'user', sub: 'u-9', handle: 'sam', roles: [], net: 'testnet' })
+  await assert.rejects(merged.principal(testnetToken, { network: 'mainnet' }), (err: unknown) => {
+    assert.equal((err as TokenError & { code: string }).code, 'wrong_network')
+    return true
+  })
+  const ok = await merged.principal(testnetToken, { network: 'testnet' })
+  assert.equal(ok.kind === 'user' ? ok.userId : null, 'u-9')
+})

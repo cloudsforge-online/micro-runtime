@@ -270,3 +270,52 @@ test('request ids are short, sortable-safe and unambiguous to read aloud', () =>
   assert.match(id, /^[0-9abcdefghjkmnpqrstvwxyz]+$/, 'no i, l, o or u — they are misread')
   assert.notEqual(newRequestId(), newRequestId())
 })
+
+/* ── THE NETWORK IS A LABEL ON THE SERIES, NOT ON THE SCRAPE JOB ──────────────────────────────────
+ *
+ * Prometheus stamped `network` per TARGET, because each network had its own pods to point a job at.
+ * After the consolidation one target serves both (micro-deploy `docs/network-consolidation.md`), so
+ * a target-level label would relabel testnet traffic as mainnet — which is micro-org#398 again,
+ * except that the previous time it was recoverable by fixing a scrape config and this time the
+ * information would never have existed.
+ */
+
+test('constant labels are stamped on every series, so a single-network service says which it is', () => {
+  const m = new Metrics({ constantLabels: { network: 'testnet' } })
+  m.register({ name: 'x_total', help: 'x', kind: 'counter', labels: ['route'] })
+  m.increment('x_total', { route: '/v1/a' })
+  const text = m.render()
+  assert.match(text, /x_total\{[^}]*network="testnet"[^}]*\}/)
+  assert.match(text, /x_total\{[^}]*route="\/v1\/a"[^}]*\}/)
+})
+
+test('a per-write label beats a constant one, which is how a merged pod reports both networks', () => {
+  // The whole point. One process, one registry, two networks in the output — impossible if the
+  // network could only be set once at construction.
+  const m = new Metrics({ constantLabels: { network: 'mainnet' } })
+  m.register({ name: 'y_total', help: 'y', kind: 'counter', labels: ['network'] })
+  m.increment('y_total', { network: 'testnet' })
+  m.increment('y_total', {})
+  const text = m.render()
+  assert.match(text, /y_total\{network="testnet"\} 1/)
+  assert.match(text, /y_total\{network="mainnet"\} 1/)
+})
+
+test('a constant label is NOT reported as undeclared, however the spec was written', () => {
+  // Constant labels are the registry's own, not the caller's. Reporting them as a mistake would
+  // put a permanent line on stderr for every metric in the process.
+  const dropped: string[] = []
+  const m = new Metrics({ constantLabels: { network: 'mainnet' }, onDropped: (d) => dropped.push(d.reason) })
+  m.register({ name: 'z_total', help: 'z', kind: 'counter', labels: ['route'] })
+  m.increment('z_total', { route: '/v1/z' })
+  assert.deepEqual(dropped, [])
+})
+
+test('the standard http and job metrics carry network, so nothing has to remember to add it', () => {
+  const http = registerHttpMetrics(new Metrics())
+  const jobs = registerJobMetrics(new Metrics())
+  http.increment('http_requests_total', { method: 'GET', route: '/v1/a', status: '200', network: 'testnet' })
+  jobs.increment('jobs_claimed_total', { kind: 'sweep', network: 'testnet' })
+  assert.match(http.render(), /http_requests_total\{[^}]*network="testnet"/)
+  assert.match(jobs.render(), /jobs_claimed_total\{[^}]*network="testnet"/)
+})
