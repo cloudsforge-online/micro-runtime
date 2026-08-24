@@ -272,3 +272,108 @@ export async function assertSchemaAtLeast(sql: Sql, expected: number): Promise<v
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
+
+/* ── ONE SERVICE, TWO NETWORKS, TWO DATABASES ─────────────────────────────────────────────────────
+ *
+ * The estate ran as two of everything — `cloudsforge-estate` and `cf-testnet`, the same services
+ * twice, each with its own postgres. Consolidating onto one set of pods (micro-deploy
+ * `docs/network-consolidation.md`) makes one process serve both, so one process now holds two
+ * handles and has to pick between them per request.
+ *
+ * ── WHY THE BOUNDARY IS A WHOLE DATABASE, AND NOT A `network` COLUMN ────────────────────────────
+ *
+ * Because a column is enforced by every query, and a database is enforced by the connection. The
+ * estate's isolation between networks is the coarsest one postgres offers — `ledger` and
+ * `ledger_testnet` are different databases, so a mainnet handle CANNOT reach a testnet row however
+ * wrong the WHERE clause is. A `network` column would put that guarantee in the hands of every
+ * query anybody writes from now on, which is the same trade the apex consolidation refused when it
+ * composed mounts at accessors rather than at call sites.
+ *
+ * This type deliberately declares its own two-value union rather than importing one from
+ * `@cloudsforge/http`. `db` has no business depending on the HTTP layer, and the unions are
+ * structurally identical, so a value crosses freely. The duplication is two words; the dependency
+ * edge would be forever.
+ */
+
+/** The two networks the estate has. */
+export type Network = 'mainnet' | 'testnet'
+
+const NETWORK_ORDER: readonly Network[] = ['mainnet', 'testnet']
+
+/** Asked for a network this process holds no handle for. Never resolved by substituting another. */
+export class NetworkNotConfiguredError extends Error {
+  override readonly name = 'NetworkNotConfiguredError'
+  constructor(message: string) {
+    super(message)
+  }
+}
+
+export interface NetworkSql {
+  /**
+   * The handle for one network.
+   *
+   * Throws when this process holds none — the single most important line in this file. A merged
+   * pod that answers a testnet request with the mainnet handle does not fail: it succeeds, writes
+   * testnet rows into mainnet tables, and looks like ordinary traffic until somebody reconciles
+   * months later. Refusing turns that into a 500 on the first request.
+   */
+  for(network: Network): Sql
+  /** The networks this process actually holds handles for, in a stable order. */
+  readonly networks: readonly Network[]
+  /**
+   * Run something once per configured network.
+   *
+   * Two callers, one shape. A WORKER has no request to take a network from, so it does its pass
+   * per network. A MIGRATOR must apply a schema change to `<db>` and `<db>_testnet` in the SAME
+   * job — miss one and the databases drift, which surfaces as the next deploy failing against
+   * whichever was skipped.
+   *
+   * Sequential, not parallel: two migrations racing for the same advisory lock is exactly the
+   * contention this package was written to remove, and a worker pass that saturates the pool for
+   * one network starves the other.
+   */
+  each(fn: (sql: Sql, network: Network) => Promise<void>): Promise<void>
+}
+
+/**
+ * A per-network selector over already-constructed handles.
+ *
+ * Takes handles rather than DSNs on purpose: this package has never owned pool construction (see
+ * `Sql`), services build their own with whatever pool sizing they need, and a factory here would
+ * quietly become the place connection limits are decided for the whole estate.
+ */
+export function networkSql(handles: Partial<Record<Network, Sql>>): NetworkSql {
+  const networks = NETWORK_ORDER.filter((n) => handles[n] !== undefined)
+  if (networks.length === 0) {
+    throw new NetworkNotConfiguredError(
+      'networkSql() was given no handles — a selector over nothing cannot serve any request, and failing at boot beats failing on the first one',
+    )
+  }
+  return {
+    networks,
+    for(network: Network): Sql {
+      const sql = handles[network]
+      if (sql === undefined) {
+        throw new NetworkNotConfiguredError(
+          `this process holds no database handle for ${network} (it has ${networks.join(', ')}) — refusing rather than using another network's`,
+        )
+      }
+      return sql
+    },
+    async each(fn: (sql: Sql, network: Network) => Promise<void>): Promise<void> {
+      for (const network of networks) {
+        try {
+          await fn(handles[network] as Sql, network)
+        } catch (err) {
+          // WHICH network failed, in the message. With two of everything, "migration failed" or
+          // "sweep failed" sends whoever is paged to read logs to find out which half of the
+          // estate is broken.
+          const message = err instanceof Error ? err.message : String(err)
+          const wrapped = new Error(`[${network}] ${message}`)
+          if (err instanceof Error && err.stack) wrapped.stack = err.stack
+          throw wrapped
+        }
+      }
+    },
+  }
+}

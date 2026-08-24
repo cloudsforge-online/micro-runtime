@@ -228,6 +228,91 @@ const PREFLIGHT_FAILURES = new WeakSet<object>()
  * Set it on an error your own `fetch` or `token` implementation raises; nothing else reads it and
  * nothing here writes it onto an error it did not create.
  */
+/* ── THE NETWORK IS A PROPERTY OF THE REQUEST ────────────────────────────────────────────────────
+ *
+ * The estate ran as two of everything — `cloudsforge-estate` and `cf-testnet`, the same 51
+ * deployments twice — and every service learned its network once, at boot, from env. Consolidating
+ * onto one set of pods (micro-deploy `docs/network-consolidation.md`) makes that boot-time constant
+ * a lie: one process now serves both.
+ *
+ * So the network travels WITH the request. The gateway is the only component allowed to create the
+ * header, from the hostname it matched; every service forwards it verbatim on every onward call,
+ * exactly as it forwards `traceparent`. Nothing downstream ever re-derives it.
+ */
+
+/** The header the gateway stamps and every hop forwards. Lower-case: node gives header names so. */
+export const NETWORK_HEADER = 'cf-network'
+
+/** The two networks the estate has. Not a string: a typo must not compile. */
+export type Network = 'mainnet' | 'testnet'
+
+const NETWORKS: ReadonlySet<string> = new Set<Network>(['mainnet', 'testnet'])
+
+/** A request whose network could not be determined. Answer 500 — never guess. */
+export class NetworkUnknownError extends Error {
+  override readonly name = 'NetworkUnknownError'
+  constructor(message: string) {
+    super(message)
+  }
+}
+
+export interface RequestNetworkOptions {
+  /**
+   * The network to assume when the header is absent — and ONLY when it is absent.
+   *
+   * Two legitimate callers, both of which know something a route cannot:
+   *
+   *   * a single-network service (`faucet` is testnet-only) that has no second network to confuse;
+   *   * `pnpm dev`, where there is no gateway in front of the process to stamp anything.
+   *
+   * Set once at boot from `CF_NETWORK_SINGLE`, never per route. A route-level default is how a
+   * merged pod acquires a silent opinion about somebody else's money.
+   */
+  readonly fallback?: Network
+}
+
+/**
+ * The network this request belongs to, or a refusal.
+ *
+ * ── WHY THIS THROWS INSTEAD OF RETURNING 'mainnet' ─────────────────────────────────────────────
+ *
+ * Because the failure it would hide is the worst one available. A merged pod holds a pool per
+ * network; picking the wrong one writes testnet activity into mainnet tables, and a default makes
+ * that outcome the QUIET one — an unrouted request, a middleware left off one router, a service
+ * that forgot to forward the header, all landing in mainnet and looking like ordinary traffic.
+ * Refusing turns every one of those into a 500 with a name on it, on the first request rather than
+ * during a later reconciliation.
+ *
+ * Accepts node's `IncomingHttpHeaders` shape directly — a repeated header arrives as an array, and
+ * the first value is taken because joining them would invent a network name that was never sent.
+ */
+export function requestNetwork(
+  headers: Record<string, string | string[] | undefined>,
+  options: RequestNetworkOptions = {},
+): Network {
+  const raw = headers[NETWORK_HEADER]
+  const value = Array.isArray(raw) ? raw[0] : raw
+  if (value !== undefined && value !== '') {
+    // No trimming and no case-folding, deliberately. This header is machine-written by the gateway
+    // from a fixed table; anything that is not exactly one of the two names means something built
+    // it that should not have, and a tolerant parse would hide that.
+    if (!NETWORKS.has(value)) {
+      throw new NetworkUnknownError(`request names network ${JSON.stringify(value)}, which is not one of mainnet, testnet`)
+    }
+    return value as Network
+  }
+  const { fallback } = options
+  if (fallback !== undefined) {
+    if (!NETWORKS.has(fallback)) {
+      throw new NetworkUnknownError(`CF_NETWORK_SINGLE is ${JSON.stringify(fallback)}, which is not one of mainnet, testnet`)
+    }
+    return fallback
+  }
+  throw new NetworkUnknownError(
+    `no ${NETWORK_HEADER} header on this request, and no CF_NETWORK_SINGLE fallback — the gateway stamps it from the hostname, so an absent one is a routing fault, not a default`,
+  )
+}
+
 export const PREFLIGHT: unique symbol = Symbol.for('cloudsforge.http.preflight')
 
 /** Marks `err` as raised before the request left this process, and returns it unchanged. */
@@ -259,6 +344,17 @@ export interface RequestOptions {
   readonly requestId?: string
   /** W3C trace context, forwarded verbatim. */
   readonly traceparent?: string
+  /**
+   * The network this call belongs to, forwarded verbatim as `CF-Network` — the same treatment as
+   * trace context above, and for the same reason: it is a property of the REQUEST that every hop
+   * must preserve, not a property of any process on the path.
+   *
+   * Omitted, no header is sent. That is what keeps a single-network deployment unchanged, and it is
+   * also why the receiving side (`requestNetwork`) refuses rather than defaults — an absent header
+   * downstream means somebody in the chain dropped it, and the only safe reading of "I don't know
+   * which network this is" is to stop.
+   */
+  readonly network?: Network
   readonly accept?: 'json' | 'text'
 }
 
@@ -591,6 +687,11 @@ export class HttpClient {
       mergeHeaders(headers, options.headers)
       if (options.requestId) headers['x-request-id'] = options.requestId
       if (options.traceparent) headers['traceparent'] = options.traceparent
+      // AFTER `mergeHeaders(headers, options.headers)` above, so a per-request `network` beats a
+      // client-wide `cf-network` in the static bag — the same precedence every other per-request
+      // header gets, and the one that matters most here: a client constructed once per process
+      // cannot know which network the request it is serving belongs to.
+      if (options.network) headers[NETWORK_HEADER] = options.network
       if (options.idempotencyKey) headers['idempotency-key'] = options.idempotencyKey
       // Tells the peer how long it has. A peer that honours it can fail fast instead of
       // doing work whose answer will be thrown away.

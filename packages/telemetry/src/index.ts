@@ -264,6 +264,22 @@ export interface MetricsOptions {
    * its own outage and would get the reporting removed again.
    */
   readonly onDropped?: (dropped: DroppedMetricWrite) => void
+  /**
+   * Labels stamped on every series this registry emits, unless the write names them itself.
+   *
+   * ── WHY `network` HAD TO STOP BEING A SCRAPE-JOB LABEL ──────────────────────────────────────
+   *
+   * Prometheus labelled `network` per TARGET, which worked only while each network had its own
+   * pods to point a job at. The consolidation (micro-deploy `docs/network-consolidation.md`) puts
+   * both networks behind one target, and a target-level label would then relabel testnet traffic
+   * as mainnet — micro-org#398 a second time, except that the first time was recoverable by
+   * editing a scrape config and this time the distinction would never have been recorded at all.
+   *
+   * So the network is stamped by whoever knows it. A single-network service knows at boot and
+   * sets it here once. A merged service knows per request and passes it per write, which beats
+   * the constant — see `#labelKey`.
+   */
+  readonly constantLabels?: Readonly<Record<string, string>>
 }
 
 /**
@@ -278,10 +294,12 @@ export class Metrics {
   readonly #values = new Map<string, Map<string, number>>()
   readonly #histograms = new Map<string, Map<string, { counts: number[]; sum: number; count: number }>>()
   readonly #onDropped: (dropped: DroppedMetricWrite) => void
+  readonly #constant: Readonly<Record<string, string>>
   readonly #reported = new Set<string>()
 
   constructor(options: MetricsOptions = {}) {
     this.#onDropped = options.onDropped ?? reportDroppedToStderr
+    this.#constant = options.constantLabels ?? {}
   }
 
   register(spec: MetricSpec): this {
@@ -370,9 +388,19 @@ export class Metrics {
         this.#report({ metric: spec?.name ?? '(unregistered)', reason: 'undeclared_label', label: name })
       }
     }
-    return allowed
-      .filter((l) => labels[l] !== undefined)
-      .map((l) => `${l}="${escapeLabel(labels[l]!)}"`)
+    // CONSTANT LABELS ARE NOT THE CALLER'S, so they are neither checked against `labels` nor
+    // reported as undeclared: they belong to the registry, and a spec written before they existed
+    // cannot have declared them. Reporting them would put a permanent stderr line under every
+    // metric in the process, which is how reporting gets deleted.
+    //
+    // A PER-WRITE VALUE WINS. That precedence is the consolidation: a single-network service sets
+    // `network` once at construction, and a merged one — which cannot know at construction which
+    // network a request belongs to — passes it per write and overrides.
+    const effective = { ...this.#constant, ...labels }
+    const names = [...new Set([...Object.keys(this.#constant), ...allowed])]
+    return names
+      .filter((l) => effective[l] !== undefined)
+      .map((l) => `${l}="${escapeLabel(effective[l]!)}"`)
       .join(',')
   }
 
@@ -448,30 +476,30 @@ export function registerHttpMetrics(metrics: Metrics): Metrics {
       name: 'http_requests_total',
       help: 'HTTP requests handled',
       kind: 'counter',
-      labels: ['method', 'route', 'status'],
+      labels: ['method', 'route', 'status', 'network'],
     })
     .register({
       name: 'http_request_duration_ms',
       help: 'HTTP request duration in milliseconds',
       kind: 'histogram',
-      labels: ['method', 'route'],
+      labels: ['method', 'route', 'network'],
     })
     .register({
       name: 'http_requests_in_flight',
       help: 'HTTP requests currently being handled',
       kind: 'gauge',
-      labels: [],
+      labels: ['network'],
     })
 }
 
 /** The standard job-runner metric set, which is what makes a stuck queue visible. */
 export function registerJobMetrics(metrics: Metrics): Metrics {
   return metrics
-    .register({ name: 'jobs_claimed_total', help: 'Jobs claimed', kind: 'counter', labels: ['kind'] })
-    .register({ name: 'jobs_completed_total', help: 'Jobs completed', kind: 'counter', labels: ['kind'] })
-    .register({ name: 'jobs_failed_total', help: 'Jobs failed', kind: 'counter', labels: ['kind'] })
-    .register({ name: 'jobs_dead_total', help: 'Jobs dead-lettered', kind: 'counter', labels: ['kind'] })
-    .register({ name: 'jobs_duration_ms', help: 'Job handler duration', kind: 'histogram', labels: ['kind'] })
-    .register({ name: 'jobs_pending', help: 'Jobs waiting to be claimed', kind: 'gauge', labels: [] })
-    .register({ name: 'jobs_overdue', help: 'Jobs due more than five minutes ago', kind: 'gauge', labels: [] })
+    .register({ name: 'jobs_claimed_total', help: 'Jobs claimed', kind: 'counter', labels: ['kind', 'network'] })
+    .register({ name: 'jobs_completed_total', help: 'Jobs completed', kind: 'counter', labels: ['kind', 'network'] })
+    .register({ name: 'jobs_failed_total', help: 'Jobs failed', kind: 'counter', labels: ['kind', 'network'] })
+    .register({ name: 'jobs_dead_total', help: 'Jobs dead-lettered', kind: 'counter', labels: ['kind', 'network'] })
+    .register({ name: 'jobs_duration_ms', help: 'Job handler duration', kind: 'histogram', labels: ['kind', 'network'] })
+    .register({ name: 'jobs_pending', help: 'Jobs waiting to be claimed', kind: 'gauge', labels: ['network'] })
+    .register({ name: 'jobs_overdue', help: 'Jobs due more than five minutes ago', kind: 'gauge', labels: ['network'] })
 }

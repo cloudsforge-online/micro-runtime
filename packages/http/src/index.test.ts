@@ -1,6 +1,16 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { CircuitOpenError, HttpClient, HttpError, PREFLIGHT, TimeoutError, redactUrl } from './index.ts'
+import {
+  CircuitOpenError,
+  HttpClient,
+  HttpError,
+  type Network,
+  NetworkUnknownError,
+  PREFLIGHT,
+  TimeoutError,
+  redactUrl,
+  requestNetwork,
+} from './index.ts'
 
 /** A fetch stand-in driven by a scripted list of responses or thrown errors. */
 function scripted(steps: Array<Response | Error | ((req: Request) => Response)>) {
@@ -544,4 +554,75 @@ test('no timer that a promise resolves on is unref\'d', async () => {
     /new Promise\([^)]*\)\s*=>\s*\{[^}]*setTimeout[^}]*unref/s,
     'a timer inside a promise executor must stay referenced',
   )
+})
+
+/* ── THE NETWORK RIDES THE REQUEST ────────────────────────────────────────────────────────────────
+ *
+ * The estate is consolidating its two networks onto one set of pods
+ * (micro-deploy `docs/network-consolidation.md`). After that, no process IS a network — every
+ * request carries one, and a service that guesses is a service that writes testnet money into
+ * mainnet ledgers. These tests pin the two halves of that contract: outbound calls forward the
+ * header verbatim, and inbound requests that lack it are a fault rather than a default.
+ */
+
+test('forwards the network as CF-Network, exactly as it forwards trace context', async () => {
+  const c = client([json({ ok: true })])
+  await c.c.request('/thing', { network: 'testnet' })
+  assert.equal(c.s.calls[0]?.headers.get('cf-network'), 'testnet')
+})
+
+test('sends no CF-Network when the caller names none, so a single-network service is unchanged', async () => {
+  const c = client([json({ ok: true })])
+  await c.c.request('/thing')
+  assert.equal(c.s.calls[0]?.headers.get('cf-network'), null)
+})
+
+test('a per-request network beats a client-wide default header', async () => {
+  // Same precedence rule as every other per-request header: the static bag is a default, the
+  // per-request value is an instruction for this one call.
+  const c = client([json({ ok: true })], { headers: { 'cf-network': 'mainnet' } })
+  await c.c.request('/thing', { network: 'testnet' })
+  assert.equal(c.s.calls[0]?.headers.get('cf-network'), 'testnet')
+})
+
+test('requestNetwork reads the header a gateway stamped', () => {
+  assert.equal(requestNetwork({ 'cf-network': 'testnet' }), 'testnet')
+  assert.equal(requestNetwork({ 'cf-network': 'mainnet' }), 'mainnet')
+})
+
+test('requestNetwork REFUSES an absent header rather than defaulting to mainnet', () => {
+  /*
+   * The whole design in one assertion. A merged pod serves both networks, so "no header" is not
+   * "the usual one" — it is a routing fault, and the only safe answer is to stop. Defaulting here
+   * would turn every misrouted testnet write into a silent mainnet write, which is the one failure
+   * this consolidation must not be able to have.
+   */
+  assert.throws(() => requestNetwork({}), NetworkUnknownError)
+  assert.throws(() => requestNetwork({ 'cf-network': '' }), NetworkUnknownError)
+})
+
+test('requestNetwork refuses a network that is not one of the two', () => {
+  assert.throws(() => requestNetwork({ 'cf-network': 'mainnet ' }), NetworkUnknownError)
+  assert.throws(() => requestNetwork({ 'cf-network': 'MAINNET' }), NetworkUnknownError)
+  assert.throws(() => requestNetwork({ 'cf-network': 'staging' }), NetworkUnknownError)
+})
+
+test('requestNetwork takes the first value when a header arrives repeated', () => {
+  // node puts a repeated header in an array. A caller sending two is already wrong; taking the
+  // first is deterministic, and the alternative — joining them — invents a network name.
+  assert.equal(requestNetwork({ 'cf-network': ['testnet', 'mainnet'] }), 'testnet')
+})
+
+test('CF_NETWORK_SINGLE lets a single-network service and pnpm dev run with no gateway', () => {
+  // faucet is testnet-only and has no second network to be confused about; `pnpm dev` has no
+  // gateway to stamp the header at all. Both need a way to say so ONCE, at boot, rather than
+  // teaching every route a default.
+  assert.equal(requestNetwork({}, { fallback: 'testnet' }), 'testnet')
+  // And an explicit header still wins over the fallback, so a mis-stamped request is visible
+  // rather than silently overwritten by the service's own opinion.
+  assert.equal(requestNetwork({ 'cf-network': 'mainnet' }, { fallback: 'testnet' }), 'mainnet')
+})
+
+test('a bad fallback is a boot-time error, not a per-request surprise', () => {
+  assert.throws(() => requestNetwork({}, { fallback: 'staging' as Network }), NetworkUnknownError)
 })

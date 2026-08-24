@@ -120,6 +120,29 @@ export interface VerifierOptions {
    * tolerance can be revisited — as a decision, not a default.
    */
   readonly expectedNetwork?: string
+  /**
+   * Called once per token that verified while carrying NO `net` claim.
+   *
+   * The tolerance above is load-bearing and temporary, and those are hard to hold together: a
+   * tolerance nobody measures is one nobody can ever close, because "are there still net-less
+   * tokens in flight?" has no answer. This makes it a number. The consolidation closes the window
+   * when it reaches zero, which is a fact rather than a date.
+   */
+  readonly onNetlessToken?: (event: { readonly network: string }) => void
+}
+
+/** Per-call overrides. `network` is the one that matters, and it is the whole consolidation. */
+export interface VerifyOptions {
+  /**
+   * The network THIS REQUEST arrived on — from the `CF-Network` header the gateway stamped
+   * (`@cloudsforge/http`'s `requestNetwork`).
+   *
+   * Supplied, it decides the gate and `expectedNetwork` is ignored. That precedence is the point:
+   * after the merge one pod serves both networks, so the deployment has no network to be, and a
+   * pod still carrying `AUTH_EXPECTED_NETWORK=mainnet` from before the merge must not refuse every
+   * testnet request routed to it.
+   */
+  readonly network?: string
 }
 
 export class Verifier {
@@ -128,6 +151,7 @@ export class Verifier {
   readonly #audience: string
   readonly #clockTolerance: number
   readonly #expectedNetwork: string | null
+  readonly #onNetless: ((event: { readonly network: string }) => void) | undefined
 
   constructor(options: VerifierOptions) {
     this.#keys = options.keySet ?? createRemoteJWKSet(new URL(options.jwksUrl))
@@ -150,9 +174,10 @@ export class Verifier {
       (typeof process !== 'undefined' ? (process.env['AUTH_EXPECTED_NETWORK'] ?? null) : null) ??
       null
     this.#clockTolerance = options.clockToleranceSec ?? 5
+    this.#onNetless = options.onNetlessToken
   }
 
-  async verify(token: string): Promise<JWTPayload> {
+  async verify(token: string, options: VerifyOptions = {}): Promise<JWTPayload> {
     if (!token) throw new TokenError('no token presented', 'missing')
     try {
       const { payload } = await jwtVerify(token, this.#keys, {
@@ -161,15 +186,29 @@ export class Verifier {
         clockTolerance: this.#clockTolerance,
         algorithms: ['RS256'],
       })
-      // The network gate, AFTER the signature: a claim on an unverified token is attacker text.
-      // See VerifierOptions.expectedNetwork for why absence is tolerated and mismatch is not.
-      if (this.#expectedNetwork !== null) {
+      // ── THE NETWORK GATE ────────────────────────────────────────────────────────────────────
+      //
+      // AFTER the signature, always: a claim on an unverified token is attacker text.
+      //
+      // WHAT it compares against moved with the consolidation (micro-deploy
+      // `docs/network-consolidation.md`). It used to be "what network is this deployment", which
+      // one pod serving both networks cannot answer. It is now "what network did this REQUEST
+      // arrive on", and the deployment constant is the fallback for the callers that have not been
+      // taught the header yet — which, on the day this ships, is all of them. That fallback is why
+      // this change is deployable alone and changes nothing until a caller opts in.
+      const expected = options.network ?? this.#expectedNetwork
+      if (expected !== null && expected !== undefined) {
         const net = (payload as { net?: unknown }).net
-        if (typeof net === 'string' && net !== this.#expectedNetwork) {
-          throw new TokenError(
-            `token minted for network ${net}, this deployment is ${this.#expectedNetwork}`,
-            'wrong_network',
-          )
+        if (typeof net === 'string') {
+          if (net !== expected) {
+            throw new TokenError(
+              `token minted for network ${net}, this request is ${expected}`,
+              'wrong_network',
+            )
+          }
+        } else {
+          // See VerifierOptions.onNetlessToken. Reported, never refused — yet.
+          this.#onNetless?.({ network: expected })
         }
       }
       return payload
@@ -192,8 +231,11 @@ export class Verifier {
   }
 
   /** Verify and narrow to a principal. Refuses a token that is neither shape. */
-  async principal(token: string): Promise<Principal> {
-    const payload = await this.verify(token)
+  async principal(token: string, options: VerifyOptions = {}): Promise<Principal> {
+    // Forwarded, not dropped. `principal()` is the method most routes actually call; a version of
+    // it that could not carry the request's network would be a hole straight through the gate,
+    // and a silent one — the token would verify and the wrong-network refusal would never run.
+    const payload = await this.verify(token, options)
     const sub = payload['sub']
     if (typeof sub !== 'string' || sub.length === 0) {
       throw new TokenError('token has no subject', 'no_subject')
