@@ -319,3 +319,256 @@ test('the standard http and job metrics carry network, so nothing has to remembe
   assert.match(http.render(), /http_requests_total\{[^}]*network="testnet"/)
   assert.match(jobs.render(), /jobs_claimed_total\{[^}]*network="testnet"/)
 })
+
+/* ── A VIEW STAMPS LABELS; IT DOES NOT FORK THE REGISTRY ──────────────────────────────────────────
+ *
+ * `registerJobMetrics` names queues by `kind`, and the names a service picks are generic on
+ * purpose. Merge `lantern` with `analytics` and both modules' `kind="rollup"` job is one series.
+ * `jobs_pending` and `jobs_overdue` carry no `kind` at all, so the two modules' samples land on the
+ * identical series and overwrite each other — a wedged queue then reads as absent rather than as
+ * high, which is the failure mode nobody goes looking for. `activity`+`notify` and
+ * `emberkin`+`aetherholm` collide the same way.
+ */
+
+test('THE COLLISION: two modules sample jobs_pending, and without a view the second erases the first', () => {
+  // The defect first, on a bare registry — this is what a merged process does today.
+  const bare = registerJobMetrics(new Metrics())
+  bare.set('jobs_pending', 11, { network: 'mainnet' }) // lantern's queue
+  bare.set('jobs_pending', 4, { network: 'mainnet' }) // analytics', a moment later
+  assert.deepEqual(
+    bare.render().match(/^jobs_pending\{.*$/gm),
+    ['jobs_pending{network="mainnet"} 4'],
+    'one series, one depth: the 11 is gone and nothing at /metrics records that it ever existed',
+  )
+
+  // The same two writers through views. Both depths survive, in one exposition.
+  const m = registerJobMetrics(new Metrics())
+  m.withLabels({ module: 'lantern' }).set('jobs_pending', 11, { network: 'mainnet' })
+  m.withLabels({ module: 'analytics' }).set('jobs_pending', 4, { network: 'mainnet' })
+  const lines = m.render().match(/^jobs_pending\{.*$/gm) ?? []
+  assert.equal(lines.length, 2, 'a wedged queue must not go invisible because its neighbour sampled last')
+  assert.ok(lines.includes('jobs_pending{module="lantern",network="mainnet"} 11'))
+  assert.ok(lines.includes('jobs_pending{module="analytics",network="mainnet"} 4'))
+})
+
+test('jobs_failed_total{kind="rollup"} from two modules is two series, not a sum', () => {
+  const m = registerJobMetrics(new Metrics())
+  const lantern = m.withLabels({ module: 'lantern' })
+  const analytics = m.withLabels({ module: 'analytics' })
+  lantern.increment('jobs_failed_total', { kind: 'rollup', network: 'mainnet' })
+  lantern.increment('jobs_failed_total', { kind: 'rollup', network: 'mainnet' })
+  analytics.increment('jobs_failed_total', { kind: 'rollup', network: 'mainnet' })
+  const text = m.render()
+  assert.match(text, /jobs_failed_total\{module="lantern",kind="rollup",network="mainnet"\} 2/)
+  assert.match(text, /jobs_failed_total\{module="analytics",kind="rollup",network="mainnet"\} 1/)
+  // KILLS: dropping the constant labels out of `#labelKey`'s series key. A single `…} 3` is the
+  // sum of two unrelated queues — a number with no meaning that an alert would still fire on, and
+  // which no operator could take apart afterwards.
+  assert.doesNotMatch(text, /jobs_failed_total\{kind="rollup",network="mainnet"\} 3/)
+})
+
+test('a per-write label still beats one a view stamps', () => {
+  // The precedence `#labelKey` already had, and for the same reason: whoever knows the value at
+  // the moment of writing wins. A merged pod stamps its module once and passes its network per
+  // request, and both have to work at the same time.
+  const m = new Metrics()
+  m.register({ name: 'q_total', help: 'q', kind: 'counter', labels: ['network'] })
+  const view = m.withLabels({ module: 'lantern', network: 'mainnet' })
+  view.increment('q_total', { network: 'testnet' })
+  view.increment('q_total')
+  const text = m.render()
+  assert.match(text, /q_total\{module="lantern",network="testnet"\} 1/)
+  assert.match(text, /q_total\{module="lantern",network="mainnet"\} 1/)
+})
+
+test('the label a view stamps is NOT reported as undeclared — no spec in the estate declares module', () => {
+  const dropped: Array<Record<string, unknown>> = []
+  const m = registerJobMetrics(new Metrics({ onDropped: (d) => void dropped.push(d as never) }))
+  const view = m.withLabels({ module: 'lantern' })
+  view.increment('jobs_failed_total', { kind: 'rollup', network: 'mainnet' })
+  view.set('jobs_pending', 3, { network: 'mainnet' })
+  // KILLS: checking `#constant` against the spec's declared `labels`. Widening all seven job specs
+  // is the change this facility exists to avoid, and a permanent stderr line under every job
+  // metric in the process is how reporting gets deleted again.
+  assert.deepEqual(dropped, [])
+
+  view.increment('never_registered')
+  assert.deepEqual(
+    dropped,
+    [{ metric: 'never_registered', reason: 'unregistered_metric' }],
+    'while a genuine mistake made through a view still reaches the sink the registry was built with',
+  )
+})
+
+test('views compose, and a view of a view carries both labels', () => {
+  const m = new Metrics()
+  m.register({ name: 'c_total', help: 'c', kind: 'counter', labels: [] })
+  m.withLabels({ module: 'lantern' }).withLabels({ shard: 'a' }).increment('c_total')
+  assert.match(m.render(), /c_total\{module="lantern",shard="a"\} 1/)
+})
+
+test('a view shares the registry rather than copying it, in both directions', () => {
+  const m = registerHttpMetrics(new Metrics())
+  const view = m.withLabels({ module: 'analytics' })
+
+  // Registered through the view; written and rendered through the original.
+  view.register({ name: 'analytics_rollups_total', help: 'rollups', kind: 'counter', labels: [] })
+  m.increment('analytics_rollups_total')
+  assert.match(m.render(), /analytics_rollups_total 1/, 'the original knows a spec the view registered')
+
+  // Registered before the view existed; written through it.
+  view.increment('http_requests_total', { method: 'GET', route: '/v1/a', status: '200', network: 'mainnet' })
+  assert.match(
+    m.render(),
+    /http_requests_total\{module="analytics",[^}]*route="\/v1\/a"/,
+    'and render() on the ORIGINAL carries what was written through the view',
+  )
+
+  // KILLS: giving the view its own `#specs`/`#values`/`#histograms`. A merged process serves ONE
+  // /metrics; a view that forked the registry would put half the series behind each object, and
+  // whichever one the route happened to call would expose only its own half.
+  assert.throws(
+    () => view.register({ name: 'analytics_rollups_total', help: 'x', kind: 'counter' }),
+    /already registered/,
+    'a forked spec map would have accepted this and then rendered the name twice',
+  )
+  assert.equal(view.render(), m.render(), 'one registry, seen twice')
+})
+
+/**
+ * ── NOTHING THAT DOES NOT CALL `withLabels` MOVES BY A BYTE ───────────────────────────────────────
+ *
+ * Adding the facility meant reworking `Metrics`'s fields from initialisers to constructor
+ * assignment, and a registry's exposition is a wire format that dashboards, recording rules and
+ * alerts are all written against. Every service in the estate builds its registry the way the
+ * fixture below does — see `lantern/src/index.ts:49` — and none of them calls `withLabels`.
+ *
+ * So this is a frozen copy of the exact bytes that composition rendered BEFORE the change, not a
+ * set of patterns that would still pass if the label order, the bucket set, the HELP/TYPE ordering
+ * or the trailing newline moved. If it fails, an existing dashboard broke.
+ */
+
+/** Mirrors `lantern/src/server.ts` `registerServiceMetrics`: the shapes a service really declares. */
+function registerServiceMetrics(metrics: Metrics): Metrics {
+  return metrics
+    .register({ name: 'lantern_up', help: 'Always 1.', kind: 'gauge', labels: [] })
+    .register({
+      name: 'lantern_events_ingested_total',
+      help: 'Log events stored, by source and severity.',
+      kind: 'counter',
+      labels: ['source', 'severity'],
+    })
+    .register({ name: 'lantern_issues_upserted_total', help: 'Issue upserts.', kind: 'counter', labels: [] })
+    .register({ name: 'lantern_issues_open', help: 'Open issues by severity.', kind: 'gauge', labels: ['severity'] })
+}
+
+const EXPOSITION_BEFORE_WITH_LABELS = `# HELP http_requests_total HTTP requests handled
+# TYPE http_requests_total counter
+http_requests_total{method="GET",route="/v1/issues",status="200",network="mainnet"} 2
+http_requests_total{method="POST",route="/v1/ingest",status="500",network="testnet"} 1
+# HELP http_request_duration_ms HTTP request duration in milliseconds
+# TYPE http_request_duration_ms histogram
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="5"} 0
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="10"} 1
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="25"} 1
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="50"} 1
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="100"} 1
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="250"} 1
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="500"} 1
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="1000"} 2
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="2500"} 2
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="5000"} 2
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="10000"} 2
+http_request_duration_ms_bucket{method="GET",route="/v1/issues",network="mainnet",le="+Inf"} 2
+http_request_duration_ms_sum{method="GET",route="/v1/issues",network="mainnet"} 647
+http_request_duration_ms_count{method="GET",route="/v1/issues",network="mainnet"} 2
+# HELP http_requests_in_flight HTTP requests currently being handled
+# TYPE http_requests_in_flight gauge
+http_requests_in_flight{network="mainnet"} 3
+# HELP jobs_claimed_total Jobs claimed
+# TYPE jobs_claimed_total counter
+jobs_claimed_total{kind="rollup",network="mainnet"} 1
+# HELP jobs_completed_total Jobs completed
+# TYPE jobs_completed_total counter
+jobs_completed_total{kind="rollup",network="mainnet"} 1
+# HELP jobs_failed_total Jobs failed
+# TYPE jobs_failed_total counter
+jobs_failed_total{kind="rollup",network="mainnet"} 1
+# HELP jobs_dead_total Jobs dead-lettered
+# TYPE jobs_dead_total counter
+jobs_dead_total{kind="retention",network="testnet"} 1
+# HELP jobs_duration_ms Job handler duration
+# TYPE jobs_duration_ms histogram
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="5"} 0
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="10"} 0
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="25"} 0
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="50"} 1
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="100"} 1
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="250"} 1
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="500"} 1
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="1000"} 1
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="2500"} 1
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="5000"} 1
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="10000"} 1
+jobs_duration_ms_bucket{kind="rollup",network="mainnet",le="+Inf"} 1
+jobs_duration_ms_sum{kind="rollup",network="mainnet"} 42
+jobs_duration_ms_count{kind="rollup",network="mainnet"} 1
+# HELP jobs_pending Jobs waiting to be claimed
+# TYPE jobs_pending gauge
+jobs_pending{network="mainnet"} 11
+# HELP jobs_overdue Jobs due more than five minutes ago
+# TYPE jobs_overdue gauge
+jobs_overdue{network="mainnet"} 2
+# HELP lantern_up Always 1.
+# TYPE lantern_up gauge
+lantern_up 1
+# HELP lantern_events_ingested_total Log events stored, by source and severity.
+# TYPE lantern_events_ingested_total counter
+lantern_events_ingested_total{source="pay",severity="error"} 1
+# HELP lantern_issues_upserted_total Issue upserts.
+# TYPE lantern_issues_upserted_total counter
+lantern_issues_upserted_total 1
+# HELP lantern_issues_open Open issues by severity.
+# TYPE lantern_issues_open gauge
+lantern_issues_open{severity="warn"} 4
+`
+
+test('a service registry that never calls withLabels renders exactly what it rendered before', () => {
+  const m = registerServiceMetrics(registerJobMetrics(registerHttpMetrics(new Metrics())))
+
+  m.increment('http_requests_total', { method: 'GET', route: '/v1/issues', status: '200', network: 'mainnet' })
+  m.increment('http_requests_total', { method: 'GET', route: '/v1/issues', status: '200', network: 'mainnet' })
+  m.increment('http_requests_total', { method: 'POST', route: '/v1/ingest', status: '500', network: 'testnet' })
+  m.observe('http_request_duration_ms', 7, { method: 'GET', route: '/v1/issues', network: 'mainnet' })
+  m.observe('http_request_duration_ms', 640, { method: 'GET', route: '/v1/issues', network: 'mainnet' })
+  m.set('http_requests_in_flight', 3, { network: 'mainnet' })
+
+  m.increment('jobs_claimed_total', { kind: 'rollup', network: 'mainnet' })
+  m.increment('jobs_completed_total', { kind: 'rollup', network: 'mainnet' })
+  m.increment('jobs_failed_total', { kind: 'rollup', network: 'mainnet' })
+  m.increment('jobs_dead_total', { kind: 'retention', network: 'testnet' })
+  m.observe('jobs_duration_ms', 42, { kind: 'rollup', network: 'mainnet' })
+  m.set('jobs_pending', 11, { network: 'mainnet' })
+  m.set('jobs_overdue', 2, { network: 'mainnet' })
+
+  m.set('lantern_up', 1)
+  m.increment('lantern_events_ingested_total', { source: 'pay', severity: 'error' })
+  m.increment('lantern_issues_upserted_total')
+  m.set('lantern_issues_open', 4, { severity: 'warn' })
+
+  // KILLS: stamping anything by default, reordering the label names in `#labelKey`, or letting a
+  // view's state leak into the registry it came from.
+  assert.equal(m.render(), EXPOSITION_BEFORE_WITH_LABELS)
+})
+
+test('taking a view does not change what the registry it came from renders', () => {
+  const build = () => registerJobMetrics(registerHttpMetrics(new Metrics()))
+  const untouched = build()
+  untouched.increment('jobs_claimed_total', { kind: 'sweep', network: 'mainnet' })
+
+  const withAView = build()
+  withAView.withLabels({ module: 'lantern' }) // taken and never written through
+  withAView.increment('jobs_claimed_total', { kind: 'sweep', network: 'mainnet' })
+
+  assert.equal(withAView.render(), untouched.render())
+})
