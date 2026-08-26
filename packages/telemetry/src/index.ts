@@ -282,6 +282,30 @@ export interface MetricsOptions {
   readonly constantLabels?: Readonly<Record<string, string>>
 }
 
+interface HistogramEntry {
+  counts: number[]
+  sum: number
+  count: number
+}
+
+/**
+ * The state a view shares with the registry it was taken from — see `Metrics.withLabels`.
+ *
+ * Passed BY REFERENCE and never copied: that is the whole mechanism. A view is a second `Metrics`
+ * object over one registry's maps, so `register` on either is visible to both and `render()` on
+ * either emits every series, whichever object wrote it.
+ *
+ * Deliberately not exported. The constructor that takes it is public because `withLabels` has to
+ * call it, but nothing outside this module can name the type — the same arrangement `Logger`
+ * already uses for the `base` fields only `child()` is meant to pass.
+ */
+interface SharedSeries {
+  readonly specs: Map<string, MetricSpec>
+  readonly values: Map<string, Map<string, number>>
+  readonly histograms: Map<string, Map<string, HistogramEntry>>
+  readonly reported: Set<string>
+}
+
 /**
  * A small Prometheus-format registry.
  *
@@ -290,16 +314,74 @@ export interface MetricsOptions {
  * same shape so the scrape config is the only remaining work.
  */
 export class Metrics {
-  readonly #specs = new Map<string, MetricSpec>()
-  readonly #values = new Map<string, Map<string, number>>()
-  readonly #histograms = new Map<string, Map<string, { counts: number[]; sum: number; count: number }>>()
+  readonly #specs: Map<string, MetricSpec>
+  readonly #values: Map<string, Map<string, number>>
+  readonly #histograms: Map<string, Map<string, HistogramEntry>>
   readonly #onDropped: (dropped: DroppedMetricWrite) => void
   readonly #constant: Readonly<Record<string, string>>
-  readonly #reported = new Set<string>()
+  readonly #reported: Set<string>
 
-  constructor(options: MetricsOptions = {}) {
+  constructor(options: MetricsOptions = {}, shared?: SharedSeries) {
     this.#onDropped = options.onDropped ?? reportDroppedToStderr
     this.#constant = options.constantLabels ?? {}
+    // Absent `shared` this is a registry of its own, which is every call site that exists today.
+    this.#specs = shared?.specs ?? new Map()
+    this.#values = shared?.values ?? new Map()
+    this.#histograms = shared?.histograms ?? new Map()
+    // The dedup set is shared too, because the flood it exists to prevent is per PROCESS, not per
+    // view: two modules writing the same unregistered name are one missing `register` call and
+    // should read as one line, not as one line per module.
+    this.#reported = shared?.reported ?? new Set()
+  }
+
+  /**
+   * The same registry, seen through labels stamped on everything written through it.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **WHAT THIS IS FOR: TWO MERGED SERVICES, ONE JOB METRIC SET.** `registerJobMetrics` names its
+   * queues by `kind`, and the names services pick are generic on purpose. When `lantern` and
+   * `analytics` become one process both register a `kind="rollup"` job and a `kind="retention"`
+   * one, so `jobs_failed_total{kind="rollup"}` becomes the SUM of two unrelated queues — a number
+   * with no meaning that an alert would still fire on.
+   *
+   * `jobs_pending` and `jobs_overdue` are worse, because they carry no `kind` at all. Both modules
+   * call `set('jobs_pending', …)` against the identical series, so each sample OVERWRITES the
+   * other's and whichever queue happens to sample last is the only one on the graph. A wedged
+   * queue would not read as high — it would not be there. Same collision for `activity`+`notify`
+   * and `emberkin`+`aetherholm`.
+   *
+   * The remedy is a `module` label, and it is stamped rather than declared for a reason. Widening
+   * every spec's `labels` would push `module` onto every call site in the estate, including the
+   * single-service ones that have nothing to say about it. A second `Metrics` would instead split
+   * `/metrics` in two, and the merged process must serve ONE endpoint carrying both modules.
+   *
+   * So a view: a `Metrics` sharing the receiver's spec and series maps, differing only in the
+   * constant labels it stamps. `register` on either is visible to both, and `render()` on either
+   * emits everything.
+   *
+   *     const metrics = registerJobMetrics(registerHttpMetrics(new Metrics()))
+   *     startLanternJobs(metrics.withLabels({ module: 'lantern' }))
+   *     startAnalyticsJobs(metrics.withLabels({ module: 'analytics' }))
+   *     app.get('/metrics', () => metrics.render())   // both modules, one endpoint
+   *
+   * Constant labels are not checked against a spec's declared `labels` and are not reported as
+   * `undeclared_label` — see `#labelKey`. That is exactly the property this needs: no spec in the
+   * estate declares `module`, and none has to.
+   *
+   * Composes, and a per-write label still beats a stamped one, both for the reason `#labelKey`
+   * gives: whoever knows a label's value at the moment of writing wins.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  withLabels(extra: Readonly<Record<string, string>>): Metrics {
+    return new Metrics(
+      { onDropped: this.#onDropped, constantLabels: { ...this.#constant, ...extra } },
+      {
+        specs: this.#specs,
+        values: this.#values,
+        histograms: this.#histograms,
+        reported: this.#reported,
+      },
+    )
   }
 
   register(spec: MetricSpec): this {
